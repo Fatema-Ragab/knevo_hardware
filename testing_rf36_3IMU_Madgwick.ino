@@ -6,9 +6,9 @@
 #define WINDOW_SIZE 40
 #define NUM_AXES 18 
 
-// 6Hz Butterworth Coefficients (100Hz Sample Rate)
-float b[] = {0.0278, 0.0556, 0.0278};
-float a[] = {-1.4755, 0.5867};
+// NEW 6Hz Butterworth Coefficients for 200Hz Sampling
+float b[] = {0.0078, 0.0156, 0.0078};
+float a[] = {-1.7347, 0.7660};
 
 // Filter States (v[2] for each axis)
 float vT[3][2] = {{0,0}, {0,0}, {0,0}}; // Thigh X, Y, Z
@@ -107,5 +107,5 @@ void loop() {
     Serial.print("GaitPhase:"); Serial.println(prediction == 1 ? 40 : 0);
   }
 
-  delay(10); 
+  delay(5);   // 200Hz
 }
