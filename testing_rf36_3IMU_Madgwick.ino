@@ -22,6 +22,9 @@ float neutralPitchT = 0, neutralPitchS = 0;
 bool systemRunning = false;
 bool hardwareDone = false;
 
+unsigned long totalInferenceTime = 0;
+unsigned long inferenceCount = 0;
+
 // NEW 6Hz Butterworth Coefficients for 200Hz Sampling
 float b[] = {0.0078, 0.0156, 0.0078};
 float a[] = {-1.7347, 0.7660};
@@ -178,6 +181,7 @@ void loop() {
   // 4. INFERENCE
   if (bufferFull) {
     float features[36];
+    // Feature extraction (Mean and Standard Deviation)
     for (int j = 0; j < 18; j++) {
       float sum = 0, sqSum = 0;
       for (int i = 0; i < WINDOW_SIZE; i++) sum += window[i][j];
@@ -190,11 +194,35 @@ void loop() {
       features[j + 18] = sqrt(sqSum / WINDOW_SIZE);
     }
 
+    // --- Start Inference Timing ---
+    unsigned long startTime = micros(); 
+
     int prediction = model.predict(features);
 
-    // Output Plotting
-    Serial.print("KneeAngle:"); Serial.print(kneeAngle); Serial.print(",");
-    Serial.print("GaitPhase:"); Serial.println(prediction == 1 ? 40 : 0);
+    unsigned long endTime = micros();
+    // --- End Inference Timing ---
+
+    // Calculate Running Average
+    unsigned long duration = endTime - startTime;
+    totalInferenceTime += duration;
+    inferenceCount++;
+    float averageInferenceTime = (float)totalInferenceTime / (float)inferenceCount;
+
+    // Convert Numeric Prediction to Text
+    // Adjust the logic (prediction == 1) based on how your specific model was labeled
+    String gaitLabel = (prediction == 1) ? "Swing" : "Stance";
+
+    // Print Results
+    Serial.print("KneeAngle:"); Serial.print(kneeAngle);
+    Serial.print(" | Phase: "); Serial.print(gaitLabel); 
+    Serial.print(" | Avg Inference: "); Serial.print(averageInferenceTime);
+    Serial.println(" us");
+
+    // Optional: Reset average every 1000 samples to prevent variable overflow
+    if (inferenceCount > 1000) {
+      totalInferenceTime = 0;
+      inferenceCount = 0;
+    }
   }
 
   delay(5); // 200Hz Loop
