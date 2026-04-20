@@ -14,16 +14,22 @@ struct Offsets {
 };
 
 Offsets thighOff, shankOff, waistOff;
-bool systemRunning = false;
 
-// 6Hz Butterworth Coefficients for 200Hz Sampling
+// NEW: Standing Neutral Alignment (To zero-center the raw IMU data)
+float neutralAT[3] = {0}, neutralAS[3] = {0}, neutralAW[3] = {0};
+float neutralPitchT = 0, neutralPitchS = 0;
+
+bool systemRunning = false;
+bool hardwareDone = false;
+
+// NEW 6Hz Butterworth Coefficients for 200Hz Sampling
 float b[] = {0.0078, 0.0156, 0.0078};
 float a[] = {-1.7347, 0.7660};
 
-// Filter States
-float vT[3][2] = {{0,0}, {0,0}, {0,0}}; 
-float vS[3][2] = {{0,0}, {0,0}, {0,0}}; 
-float vW[3][2] = {{0,0}, {0,0}, {0,0}}; 
+// Filter States (v[2] for each axis)
+float vT[3][2] = {{0,0}, {0,0}, {0,0}}; // Thigh X, Y, Z
+float vS[3][2] = {{0,0}, {0,0}, {0,0}}; // Shank X, Y, Z
+float vW[3][2] = {{0,0}, {0,0}, {0,0}}; // Waist X, Y, Z
 
 Adafruit_MPU6050 mpuThigh, mpuShank, mpuWaist;
 Madgwick filterT, filterS;
@@ -33,8 +39,7 @@ float window[WINDOW_SIZE][NUM_AXES];
 int bufferIndex = 0;
 bool bufferFull = false;
 
-// --- CORE FUNCTIONS ---
-
+// Modular Butterworth Function (Direct Form II Transposed)
 float butterworth(float input, float* v, float b[], float a[]) {
     float output = b[0] * input + v[0];
     v[0] = b[1] * input - a[0] * output + v[1];
@@ -42,58 +47,82 @@ float butterworth(float input, float* v, float b[], float a[]) {
     return output;
 }
 
-void calibrateSensors() {
-  Serial.println("\n[CALIBRATION] Starting... KEEP THE EXOSKELETON STILL.");
+// 1. Hardware Calibration: Fixes internal chip Bias/Zero Error (Run while sitting/still)
+void calibrateHardware() {
+  Serial.println("\n[STEP 1] Hardware Calibration... KEEP STILL.");
   sensors_event_t a, g, temp;
-  
-  float sAT[3] = {0}, sGT[3] = {0};
-  float sAS[3] = {0}, sGS[3] = {0};
-  float sAW[3] = {0}, sGW[3] = {0};
+  float sAT[3] = {0}, sGT[3] = {0}, sAS[3] = {0}, sGS[3] = {0}, sAW[3] = {0}, sGW[3] = {0};
 
   for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
     mpuThigh.getEvent(&a, &g, &temp);
     sAT[0]+=a.acceleration.x; sAT[1]+=a.acceleration.y; sAT[2]+=a.acceleration.z;
     sGT[0]+=g.gyro.x; sGT[1]+=g.gyro.y; sGT[2]+=g.gyro.z;
-
     mpuShank.getEvent(&a, &g, &temp);
     sAS[0]+=a.acceleration.x; sAS[1]+=a.acceleration.y; sAS[2]+=a.acceleration.z;
     sGS[0]+=g.gyro.x; sGS[1]+=g.gyro.y; sGS[2]+=g.gyro.z;
-
     mpuWaist.getEvent(&a, &g, &temp);
     sAW[0]+=a.acceleration.x; sAW[1]+=a.acceleration.y; sAW[2]+=a.acceleration.z;
     sGW[0]+=g.gyro.x; sGW[1]+=g.gyro.y; sGW[2]+=g.gyro.z;
-    
     if(i % 100 == 0) Serial.print(".");
-    delay(5); // Match 200Hz timing
+    delay(5);
   }
-
-  // Calculate averages. Note: For Z-axis, we subtract 9.81 to find the sensor error relative to gravity.
+  // Subtracting 9.81 on Z to create a Linear Accelerometer baseline
   thighOff = {sAT[0]/500, sAT[1]/500, (sAT[2]/500) - 9.81, sGT[0]/500, sGT[1]/500, sGT[2]/500};
   shankOff = {sAS[0]/500, sAS[1]/500, (sAS[2]/500) - 9.81, sGS[0]/500, sGS[1]/500, sGS[2]/500};
   waistOff = {sAW[0]/500, sAW[1]/500, (sAW[2]/500) - 9.81, sGW[0]/500, sGW[1]/500, sGW[2]/500};
+  Serial.println("\nHardware Calibrated.");
+}
 
-  Serial.println("\n[CALIBRATION] Complete. Offsets stored.");
+// 2. Standing Alignment: Zero-centers raw IMU data based on "Straight" pose
+void alignNeutralPose() {
+  Serial.println("\n[STEP 2] Standing Alignment... STAND STRAIGHT.");
+  sensors_event_t aT, gT, aS, gS, aW, gW, temp;
+  float sumAT[3]={0}, sumAS[3]={0}, sumAW[3]={0}, pT=0, pS=0;
+
+  for (int i = 0; i < 200; i++) {
+    mpuThigh.getEvent(&aT, &gT, &temp);
+    mpuShank.getEvent(&aS, &gS, &temp);
+    mpuWaist.getEvent(&aW, &gW, &temp);
+
+    // Update filters to find current "Standing" tilt
+    filterT.updateIMU((gT.gyro.x-thighOff.gx)*57.3, (gT.gyro.y-thighOff.gy)*57.3, (gT.gyro.z-thighOff.gz)*57.3, aT.acceleration.x-thighOff.ax, aT.acceleration.y-thighOff.ay, aT.acceleration.z-thighOff.az);
+    filterS.updateIMU((gS.gyro.x-shankOff.gx)*57.3, (gS.gyro.y-shankOff.gy)*57.3, (gS.gyro.z-shankOff.gz)*57.3, aS.acceleration.x-shankOff.ax, aS.acceleration.y-shankOff.ay, aS.acceleration.z-shankOff.az);
+    
+    pT += filterT.getPitch(); pS += filterS.getPitch();
+    
+    // Capture static acceleration (Linear acceleration baseline)
+    sumAT[0] += (aT.acceleration.x - thighOff.ax); sumAT[1] += (aT.acceleration.y - thighOff.ay); sumAT[2] += (aT.acceleration.z - thighOff.az);
+    sumAS[0] += (aS.acceleration.x - shankOff.ax); sumAS[1] += (aS.acceleration.y - shankOff.ay); sumAS[2] += (aS.acceleration.z - shankOff.az);
+    sumAW[0] += (aW.acceleration.x - waistOff.ax); sumAW[1] += (aW.acceleration.y - waistOff.ay); sumAW[2] += (aW.acceleration.z - waistOff.az);
+    delay(5);
+  }
+  neutralPitchT = pT / 200.0;
+  neutralPitchS = pS / 200.0;
+  for(int i=0; i<3; i++) {
+    neutralAT[i] = sumAT[i]/200.0; neutralAS[i] = sumAS[i]/200.0; neutralAW[i] = sumAW[i]/200.0;
+  }
+  Serial.println("Standing Neutral Aligned.");
 }
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(4, 5);   
-  Wire1.begin(6, 7);  
+  Wire.begin(4, 5);   // I2C Bus 0
+  Wire1.begin(6, 7);  // I2C Bus 1
   
   if(!mpuThigh.begin(0x68, &Wire))  Serial.println("Thigh MPU Failed");
   if(!mpuShank.begin(0x69, &Wire))  Serial.println("Shank MPU Failed");
   if(!mpuWaist.begin(0x68, &Wire1)) Serial.println("Waist MPU Failed");
 
   Serial.println("\n--- REHAB EXOSKELETON SYSTEM ---");
-  Serial.println("Commands: 'c' to Calibrate & Start");
+  Serial.println("1. Type 'c' to Calibrate Hardware (Sitting/Still)");
+  Serial.println("2. Type 'a' to Align Standing Pose (Standing Straight)");
 
-  // Wait for user 'c' input
   while (!systemRunning) {
     if (Serial.available() > 0) {
-      if (Serial.read() == 'c') {
-        calibrateSensors();
-        systemRunning = true;
-      }
+      char cmd = Serial.read();
+      if (cmd == 'c') { calibrateHardware(); hardwareDone = true; }
+      if (cmd == 'a' && hardwareDone) { alignNeutralPose(); systemRunning = true; }
+      else if (cmd == 'a' && !hardwareDone) Serial.println("Run 'c' first!");
     }
   }
 
@@ -108,36 +137,40 @@ void loop() {
   mpuShank.getEvent(&aS, &gS, &temp);
   mpuWaist.getEvent(&aW, &gW, &temp);
 
-  // 1. APPLY OFFSETS & FILTER (Subtracting bias)
+  // 1. APPLY OFFSETS & FILTER (Subtracting hardware bias AND standing neutral mean)
   float fAT[3], fAS[3], fAW[3];
   
-  fAT[0] = butterworth(aT.acceleration.x - thighOff.ax, vT[0], b, a);
-  fAT[1] = butterworth(aT.acceleration.y - thighOff.ay, vT[1], b, a);
-  fAT[2] = butterworth(aT.acceleration.z - thighOff.az, vT[2], b, a);
+  // Filter Thigh - Centered at 0 for standing
+  fAT[0] = butterworth((aT.acceleration.x - thighOff.ax) - neutralAT[0], vT[0], b, a);
+  fAT[1] = butterworth((aT.acceleration.y - thighOff.ay) - neutralAT[1], vT[1], b, a);
+  fAT[2] = butterworth((aT.acceleration.z - thighOff.az) - neutralAT[2], vT[2], b, a);
 
-  fAS[0] = butterworth(aS.acceleration.x - shankOff.ax, vS[0], b, a);
-  fAS[1] = butterworth(aS.acceleration.y - shankOff.ay, vS[1], b, a);
-  fAS[2] = butterworth(aS.acceleration.z - shankOff.az, vS[2], b, a);
+  // Filter Shank
+  fAS[0] = butterworth((aS.acceleration.x - shankOff.ax) - neutralAS[0], vS[0], b, a);
+  fAS[1] = butterworth((aS.acceleration.y - shankOff.ay) - neutralAS[1], vS[1], b, a);
+  fAS[2] = butterworth((aS.acceleration.z - shankOff.az) - neutralAS[2], vS[2], b, a);
 
-  fAW[0] = butterworth(aW.acceleration.x - waistOff.ax, vW[0], b, a);
-  fAW[1] = butterworth(aW.acceleration.y - waistOff.ay, vW[1], b, a);
-  fAW[2] = butterworth(aW.acceleration.z - waistOff.az, vW[2], b, a);
+  // Filter Waist
+  fAW[0] = butterworth((aW.acceleration.x - waistOff.ax) - neutralAW[0], vW[0], b, a);
+  fAW[1] = butterworth((aW.acceleration.y - waistOff.ay) - neutralAW[1], vW[1], b, a);
+  fAW[2] = butterworth((aW.acceleration.z - waistOff.az) - neutralAW[2], vW[2], b, a);
 
   // 2. STORE IN WINDOW
+  // Note: Using Rad/s for raw IMU features as per Camargo dataset
   float currentSample[18] = {
     fAT[0], fAT[1], fAT[2], gT.gyro.x - thighOff.gx, gT.gyro.y - thighOff.gy, gT.gyro.z - thighOff.gz,
     fAS[0], fAS[1], fAS[2], gS.gyro.x - shankOff.gx, gS.gyro.y - shankOff.gy, gS.gyro.z - shankOff.gz,
     fAW[0], fAW[1], fAW[2], gW.gyro.x - waistOff.gx, gW.gyro.y - waistOff.gy, gW.gyro.z - waistOff.gz
   };
 
-  // 3. MADGWICK ORIENTATION (Applying Gyro Offsets)
-  // Rad/s to Deg/s conversion: 57.3
+  // 3. MADGWICK ORIENTATION
+  // Rad/s to Deg/s conversion: 57.3 for library calculation
   filterT.updateIMU((gT.gyro.x - thighOff.gx)*57.3, (gT.gyro.y - thighOff.gy)*57.3, (gT.gyro.z - thighOff.gz)*57.3, fAT[0], fAT[1], fAT[2]);
   filterS.updateIMU((gS.gyro.x - shankOff.gx)*57.3, (gS.gyro.y - shankOff.gy)*57.3, (gS.gyro.z - shankOff.gz)*57.3, fAS[0], fAS[1], fAS[2]);
   
-  float kneeAngle = filterT.getPitch() - filterS.getPitch();
+  // Real-time Knee Angle calculation
+  float kneeAngle = (filterT.getPitch() - neutralPitchT) - (filterS.getPitch() - neutralPitchS);
 
-  
   for(int i=0; i<18; i++) window[bufferIndex][i] = currentSample[i];
   bufferIndex = (bufferIndex + 1) % WINDOW_SIZE;
   if (bufferIndex == 0) bufferFull = true;
@@ -159,6 +192,7 @@ void loop() {
 
     int prediction = model.predict(features);
 
+    // Output Plotting
     Serial.print("KneeAngle:"); Serial.print(kneeAngle); Serial.print(",");
     Serial.print("GaitPhase:"); Serial.println(prediction == 1 ? 40 : 0);
   }
