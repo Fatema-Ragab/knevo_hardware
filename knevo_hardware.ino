@@ -7,6 +7,9 @@
 #define WINDOW_SIZE 40
 #define NUM_AXES 18 
 
+unsigned long totalInferenceTime = 0;
+unsigned long inferenceCount = 0;
+
 // Hardware Objects
 Adafruit_MPU6050 mpuThigh, mpuShank, mpuWaist;
 Madgwick filterT, filterS;
@@ -32,6 +35,7 @@ void setup() {
   filterT.begin(100);
   filterS.begin(100);
   Serial.println("System Initialized...");
+  delay(2000);
 }
 
 void loop() {
@@ -75,14 +79,36 @@ void loop() {
       features[j + 18] = sqrt(sqSum / WINDOW_SIZE); // 18-35: Stds
     }
 
-    // Predict Gait Phase
+    // --- Start Inference Timing ---
+    unsigned long startTime = micros(); 
+
     int prediction = model.predict(features);
 
-    // 5. PLOT RESULTS
-    // Knee Angle (Smooth wave) vs Phase (Spikes 0 or 40)
-    Serial.print("KneeAngle:"); Serial.print(kneeAngle); Serial.print(",");
-    Serial.print("GaitPhase:"); Serial.println(prediction == 1 ? 40 : 0);
+    unsigned long endTime = micros();
+    // --- End Inference Timing ---
+
+    // Calculate Running Average
+    unsigned long duration = endTime - startTime;
+    totalInferenceTime += duration;
+    inferenceCount++;
+    float averageInferenceTime = (float)totalInferenceTime / (float)inferenceCount;
+
+    // Convert Numeric Prediction to Text
+    // Adjust the logic (prediction == 1) based on how your specific model was labeled
+    String gaitLabel = (prediction == 1) ? "Swing" : "Stance";
+
+    // Print Results
+    //Serial.print("KneeAngle:"); Serial.print(kneeAngle);
+    Serial.print(" | Phase: "); Serial.print(gaitLabel); 
+    Serial.print(" | Avg Inference: "); Serial.print(averageInferenceTime);
+    Serial.println(" us");
+
+    // Optional: Reset average every 1000 samples to prevent variable overflow
+    if (inferenceCount > 1000) {
+      totalInferenceTime = 0;
+      inferenceCount = 0;
+    }
   }
 
-  delay(10); // Maintain ~100Hz loop
+  delay(5); // Maintain ~100Hz loop
 }
