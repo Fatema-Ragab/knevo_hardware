@@ -12,8 +12,8 @@
 #include "test_stride.h"  
 
 namespace {
-    // FIXED: Downscaled to 240KB to safely fit inside your 279.99KB largest continuous block
-    const size_t kTensorArenaSize = 240 * 1024; 
+    // FIXED: Changed to 130KB to guarantee allocation inside the internal SRAM block
+    const size_t kTensorArenaSize = 130 * 1024; 
     uint8_t* tensor_arena = nullptr;
 
     const tflite::Model* model = nullptr;
@@ -21,7 +21,6 @@ namespace {
     TfLiteTensor* input = nullptr;
     TfLiteTensor* output = nullptr;
     
-    // Flat 1D array allocated internally for high-speed block copies
     float* flat_window_buffer = nullptr;
     int current_sample_row = 0;
     bool window_ready = false;
@@ -32,17 +31,17 @@ void setup() {
     delay(2000);
     Serial.println("Initializing Knevo Neural Network (Optimized Internal SRAM)...");
 
-    // 1. Allocate flat window feature buffer in fast internal RAM
+    // Allocate flat window feature buffer in fast internal RAM
     size_t buffer_size = KNEVO_TCN_WINDOW_SIZE * KNEVO_TCN_FEATURE_COUNT * sizeof(float);
     flat_window_buffer = (float*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL);
 
-    // 2. Allocate the 240KB Arena in internal SRAM to force ESP-NN vector speed
+    // Allocate the 130KB Arena in internal SRAM to force ESP-NN vector speed
     tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (tensor_arena == nullptr) {
-        Serial.println("CRITICAL ERROR: Internal SRAM allocation failed even at 240KB!");
+        Serial.println("CRITICAL ERROR: Internal SRAM allocation failed at 130KB!");
         while (1);
     }
-    Serial.println("-> Success! 240KB Tensor Arena allocated in fast internal SRAM.");
+    Serial.println("-> Success! 130KB Tensor Arena allocated in fast internal SRAM.");
 
     model = tflite::GetModel(g_knevo_boosted_phase_cnn_6phase_model);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
@@ -67,10 +66,8 @@ void setup() {
         model, micro_op_resolver, tensor_arena, kTensorArenaSize);
     interpreter = &static_interpreter;
 
-    // Test allocation space boundaries
     if (interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("Error: Tensor allocation failed! 240KB is too small for layer scratchpads.");
-        Serial.println("Increment kTensorArenaSize slightly (e.g., to 260 * 1024).");
+        Serial.println("Error: Tensor allocation failed! 130KB is too small for layer scratchpads.");
         while (1);
     }
 
@@ -109,6 +106,7 @@ void loop() {
         // Standardize, Quantize, and Map directly into the flat tensor layout
         int tensor_idx = 0;
         for (int t = 0; t < KNEVO_TCN_WINDOW_SIZE; t++) {
+            // FIXED: Corrected chronological window index mapping
             int chronological_idx = (current_sample_row + t) % KNEVO_TCN_WINDOW_SIZE;
             float* row_ptr = flat_window_buffer + (chronological_idx * KNEVO_TCN_FEATURE_COUNT);
             
