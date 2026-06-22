@@ -6,9 +6,10 @@
 #include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
 #include <tensorflow/lite/schema/schema_generated.h>
 
-// Your model arrays from your local sketch folder
+// Your model files from the sketch folder
 #include "knevo_esp32_boosted_phase_cnn_6phase_model.h"
 #include "knevo_esp32_boosted_phase_cnn_scaler.h"
+#include "test_stride.h"  // <-- ADD THIS LINE TO BIND YOUR DATASET PLAYBACK
 
 namespace {
     // 350KB working arena buffer
@@ -87,14 +88,24 @@ void setup() {
     Serial.println("System Ready! Generating hardware-accelerated predictions...");
 }
 
+int playback_row_counter = 0; // Tracks our position in the recorded dataset
+
 void loop() {
-    // Generate simulated sensor inputs (57 channels)
     float simulated_sensors[KNEVO_TCN_FEATURE_COUNT];
+
+    // 1. Read sequentially from your dataset array instead of generating random noise
     for(int i = 0; i < KNEVO_TCN_FEATURE_COUNT; i++) {
-        simulated_sensors[i] = random(-200, 200) / 100.0f; 
+        // Read a true, structured data coordinate from the header file
+        simulated_sensors[i] = TEST_STRIDE_DATA[playback_row_counter][i]; 
     }
 
-    // Push sample into sliding buffer
+    // Advance to the next row for the next loop iteration
+    playback_row_counter++;
+    if (playback_row_counter >= TEST_STRIDE_ROWS) {
+        playback_row_counter = 0; // Loop back to the start of the stride cycle
+    }
+
+    // 2. Push sample into the shifting history window buffer
     for (int f = 0; f < KNEVO_TCN_FEATURE_COUNT; f++) {
         window_buffer[buffer_index][f] = simulated_sensors[f];
     }
@@ -114,16 +125,16 @@ void loop() {
             for (int f = 0; f < KNEVO_TCN_FEATURE_COUNT; f++) {
                 float raw_val = window_buffer[chronological_idx][f];
                 
-                // Standardize
+                // Standardize 
                 float standardized = (raw_val - KNEVO_TCN_MEAN[f]) / KNEVO_TCN_STD[f];
                 
-                // Quantize to INT8
+                // Quantize to INT8 
                 int32_t q_val = (int32_t)round(standardized / KNEVO_TCN_INPUT_SCALE) + KNEVO_TCN_INPUT_ZERO_POINT;
                 input->data.int8[tensor_idx++] = (int8_t)constrain(q_val, -128, 127);
             }
         }
 
-        // Invoke execution
+        // Invoke execution 
         if (interpreter->Invoke() == kTfLiteOk) {
             uint32_t execution_duration = micros() - start_time;
 
@@ -149,5 +160,5 @@ void loop() {
             Serial.println("Prediction execution failed.");
         }
     }
-    delay(10); // Run loop at ~100Hz
+    delay(10); // Run loop at 100Hz (10ms matching your exact dataset collection frequency)
 }
