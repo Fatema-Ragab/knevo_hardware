@@ -77,7 +77,8 @@ float cycleHistoryMs[CYCLE_HISTORY_SIZE];
 int cycleHistoryCount = 0;
 int cycleHistoryIdx = 0;
 float medianCycleMs = 1200.0f;   // placeholder guess until the first real cycle completes
-int completedCycles = 0;
+int completedCycles = 0;        // monotonic running total - never reset, used for phase-summary diffs
+bool recentCycleValid = false;  // can drop after a long pause - drives GaitValid
 
 // ----- EVENT COUNTERS (for phase summaries) -----
 int risingEdgeCount = 0;      // every detected rising edge, before debounce
@@ -275,11 +276,12 @@ void loop() {
             cycleHistoryIdx = (cycleHistoryIdx + 1) % CYCLE_HISTORY_SIZE;
             if (cycleHistoryCount < CYCLE_HISTORY_SIZE) cycleHistoryCount++;
             medianCycleMs = medianOf(cycleHistoryMs, cycleHistoryCount);
-            completedCycles++;
+            completedCycles++;        // running total - always increments on a real cycle
+            recentCycleValid = true;  // timing is trustworthy again
           } else {
             Serial.print("  -> gap "); Serial.print(thisCycle);
             Serial.println(" ms exceeds MAX_PLAUSIBLE_CYCLE_MS, treating as restart (not counted as a cycle)");
-            completedCycles = 0;  // require a fresh pair of strikes before trusting GaitPercent again
+            recentCycleValid = false;  // require a fresh pair of strikes before trusting GaitPercent again
           }
         }
         lastHeelStrikeMs = now;
@@ -291,7 +293,7 @@ void loop() {
       Serial.print(" score="); Serial.println(contactScore, 2);
     }
 
-    if (hasLastHeelStrike && completedCycles >= 1) {
+    if (hasLastHeelStrike && recentCycleValid) {
       float elapsed = (float)(now - lastHeelStrikeMs);
       float frac = elapsed / medianCycleMs;
       if (frac < 0) frac = 0;
