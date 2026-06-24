@@ -43,6 +43,14 @@ const float CONTACT_LOW  = 0.20f;
 // ----- DEBOUNCE -----
 const float MIN_CYCLE_FRACTION = 0.65f;
 
+// ----- GAP TIMEOUT -----
+// Real measured gait cycles topped out around ~2.9s even at the slowest
+// tested speed. A gap longer than this is treated as "stopped/restarted",
+// not a real slow stride - prevents one long pause from poisoning the
+// rolling median (which would otherwise also make the debounce reject
+// legitimate fast presses afterward, with no way to self-correct).
+const unsigned long MAX_PLAUSIBLE_CYCLE_MS = 4000;
+
 // ----- ROLLING MEDIAN CYCLE WINDOW -----
 const int CYCLE_HISTORY_SIZE = 5;
 
@@ -89,10 +97,10 @@ struct TestPhase {
 TestPhase phases[] = {
   {"Do NOT touch the sensors. Stay idle.", 5000},
   {"Press and fully release the FSR ONCE.", 5000},
-  {"Press and release TWICE at a normal pace (about 1 press every 1-2 seconds).", 8000},
+  {"Press and release REPEATEDLY at ~1 press every 1-2 seconds. Keep going the WHOLE time, do not stop early.", 10000},
   {"Press and release TWICE very fast, less than half a second apart.", 5000},
-  {"Press and release at a steady rhythm, about once per second, for the full duration.", 10000},
-  {"Press and release SLOWER now, about once every 2 seconds, for the full duration.", 10000},
+  {"Press and release REPEATEDLY at a steady ~1 press per second. Keep going the WHOLE time, aim for 8-10 presses.", 12000},
+  {"Press and release REPEATEDLY about once every 2 seconds. Keep going the WHOLE time, aim for 5-6 presses.", 12000},
 };
 const int NUM_PHASES = 6;
 int currentPhase = 0;
@@ -102,6 +110,7 @@ int risingEdgeAtPhaseStart = 0;
 int acceptedAtPhaseStart = 0;
 int completedAtPhaseStart = 0;
 bool allPhasesDone = false;
+unsigned long lastHeartbeatTime = 0;
 
 float normalize(int raw, float lo, float hi) {
   if (hi - lo < 1.0f) hi = lo + 1.0f;
@@ -167,6 +176,14 @@ void calibrate() {
   Serial.print("]  mid [");
   Serial.print(midLow); Serial.print(", "); Serial.print(midHigh);
   Serial.println("]");
+
+  const float MIN_DYNAMIC_RANGE = 200.0f;  // raw ADC counts
+  if ((heelHigh - heelLow) < MIN_DYNAMIC_RANGE) {
+    Serial.println("WARNING: heel dynamic range is very small - sensor may not have been pressed during Step B. Consider recalibrating.");
+  }
+  if ((midHigh - midLow) < MIN_DYNAMIC_RANGE) {
+    Serial.println("WARNING: midfoot dynamic range is very small - sensor may not have been pressed during Step B. Consider recalibrating.");
+  }
   Serial.println("=== CALIBRATION DONE ===");
 }
 
@@ -252,12 +269,18 @@ void loop() {
       if (accept) {
         acceptedStrikeCount++;
         if (hasLastHeelStrike) {
-          float thisCycle = (float)(now - lastHeelStrikeMs);
-          cycleHistoryMs[cycleHistoryIdx] = thisCycle;
-          cycleHistoryIdx = (cycleHistoryIdx + 1) % CYCLE_HISTORY_SIZE;
-          if (cycleHistoryCount < CYCLE_HISTORY_SIZE) cycleHistoryCount++;
-          medianCycleMs = medianOf(cycleHistoryMs, cycleHistoryCount);
-          completedCycles++;
+          unsigned long thisCycle = now - lastHeelStrikeMs;
+          if (thisCycle <= MAX_PLAUSIBLE_CYCLE_MS) {
+            cycleHistoryMs[cycleHistoryIdx] = (float)thisCycle;
+            cycleHistoryIdx = (cycleHistoryIdx + 1) % CYCLE_HISTORY_SIZE;
+            if (cycleHistoryCount < CYCLE_HISTORY_SIZE) cycleHistoryCount++;
+            medianCycleMs = medianOf(cycleHistoryMs, cycleHistoryCount);
+            completedCycles++;
+          } else {
+            Serial.print("  -> gap "); Serial.print(thisCycle);
+            Serial.println(" ms exceeds MAX_PLAUSIBLE_CYCLE_MS, treating as restart (not counted as a cycle)");
+            completedCycles = 0;  // require a fresh pair of strikes before trusting GaitPercent again
+          }
         }
         lastHeelStrikeMs = now;
         hasLastHeelStrike = true;
@@ -286,10 +309,18 @@ void loop() {
     if (!phaseAnnounced) {
       phaseAnnounced = true;
       phaseStartTime = now;
+      lastHeartbeatTime = now;
       risingEdgeAtPhaseStart = risingEdgeCount;
       acceptedAtPhaseStart = acceptedStrikeCount;
       completedAtPhaseStart = completedCycles;
       announcePhase();
+    }
+
+    if (now - lastHeartbeatTime >= 2000 &&
+        now - phaseStartTime < phases[currentPhase].durationMs) {
+      lastHeartbeatTime = now;
+      unsigned long remaining = phases[currentPhase].durationMs - (now - phaseStartTime);
+      Serial.print("  ...keep going, "); Serial.print(remaining / 1000); Serial.println("s left");
     }
 
     if (now - phaseStartTime >= phases[currentPhase].durationMs) {
