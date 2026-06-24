@@ -67,9 +67,15 @@ const unsigned long FEEDBACK_MS = 250;  // actual angle read slower to avoid blo
 const float LOOKAHEAD_PERCENT = 4.0f;
 const float COMMAND_SMOOTH_ALPHA = 0.18f;
 
-// Simulated gait input - retuned to a realistic ~1.8s walking cycle.
+// Simulated gait input - retuned to a realistic walking cycle.
 // (100.0 / SIM_GAIT_SPEED_PERCENT_PER_SEC = cycle length in seconds)
-const float SIM_GAIT_SPEED_PERCENT_PER_SEC = 55.6f;
+// NOTE: COMMAND_SMOOTH_ALPHA and LOOKAHEAD_PERCENT below were tuned and
+// proven smooth at the ORIGINAL ~12.5s pace. Speeding the cycle up makes
+// the actuator track the same curve shape proportionally faster, which
+// shows up first in the most curvature-dense part of the curve (the
+// 0-30% early-stance "knee flexion wave"). If it's still rough at this
+// pace, slow it further before retuning ALPHA/LOOKAHEAD blind.
+const float SIM_GAIT_SPEED_PERCENT_PER_SEC = 45.5f;
 
 // ML / gait_percent plausibility (kept as-is; not exercised by the
 // simulated input, which never jumps, but left in place since this
