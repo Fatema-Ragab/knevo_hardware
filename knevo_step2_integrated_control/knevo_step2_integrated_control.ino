@@ -507,6 +507,7 @@ void updateHeelStrikeTracker() {
   else if (inContact && contactScore <= CONTACT_LOW) inContact = false;
 
   bool risingEdge = (!wasContact && inContact);
+  bool fallingEdge = (wasContact && !inContact);
 
   if (risingEdge) {
     bool accept = true;
@@ -516,6 +517,12 @@ void updateHeelStrikeTracker() {
         accept = false;
       }
     }
+
+    Serial.print(now); Serial.print(" ms | CONTACT START | heelRaw=");
+    Serial.print(heelRaw); Serial.print(" midRaw="); Serial.print(midRaw);
+    Serial.print(" score="); Serial.print(contactScore, 2);
+    Serial.print(" | accepted="); Serial.println(accept ? "YES" : "NO (debounce)");
+
     if (accept) {
       if (hasLastHeelStrike) {
         unsigned long thisCycle = now - lastHeelStrikeMs;
@@ -527,12 +534,18 @@ void updateHeelStrikeTracker() {
           completedCycles++;
           recentCycleValid = true;
         } else {
+          Serial.print("  -> gap "); Serial.print(thisCycle);
+          Serial.println(" ms exceeds MAX_PLAUSIBLE_CYCLE_MS, treating as restart (holding Gait_percent until next confirmed cycle)");
           recentCycleValid = false;
         }
       }
       lastHeelStrikeMs = now;
       hasLastHeelStrike = true;
     }
+  } else if (fallingEdge) {
+    Serial.print(now); Serial.print(" ms | CONTACT END   | heelRaw=");
+    Serial.print(heelRaw); Serial.print(" midRaw="); Serial.print(midRaw);
+    Serial.print(" score="); Serial.println(contactScore, 2);
   }
 
   if (hasLastHeelStrike && recentCycleValid) {
