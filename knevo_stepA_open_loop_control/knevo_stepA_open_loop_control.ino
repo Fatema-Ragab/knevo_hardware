@@ -65,7 +65,12 @@ const unsigned long PLOT_MS     = 50;   // serial plotter update
 const unsigned long FEEDBACK_MS = 250;  // actual angle read slower to avoid blocking motion
 
 const float LOOKAHEAD_PERCENT = 4.0f;
-const float COMMAND_SMOOTH_ALPHA = 0.18f;
+// Softened from 0.18 -> 0.12: the early-stance region (0-30% gait) is the
+// only spot with a quick direction reversal, which likely shows up as
+// gearbox backlash (a fast snap at that one spot, smooth elsewhere even at
+// higher speed - confirmed from video). A gentler filter eases into the
+// reversal more gradually instead of commanding it abruptly.
+const float COMMAND_SMOOTH_ALPHA = 0.12f;
 
 // Simulated gait input - retuned to a realistic walking cycle.
 // (100.0 / SIM_GAIT_SPEED_PERCENT_PER_SEC = cycle length in seconds)
