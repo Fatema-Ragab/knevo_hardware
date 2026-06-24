@@ -52,6 +52,13 @@ const unsigned long FEEDBACK_MS = 250;    // 4Hz actual-angle read, same as prod
 const unsigned long PRINT_MS    = 1000;   // 1Hz status print, test-only
 const int COUNTDOWN_SECONDS     = 5;
 
+// ----- LOGIC-ONLY SANITY CHECK -----
+// Set true to fake a bad reading and confirm the freeze branch + LED
+// actually fire from a known bad number, independent of whether the
+// real hardware can physically produce that number yet. Set back to
+// false before doing the real mechanical-block test.
+const bool USE_FAKE_ANGLE_TEST = true;
+
 uint8_t cmdOn[5] = {0x3E, 0x88, 0x01, 0x00, 0xC7};
 
 bool systemFrozen = false;
@@ -262,6 +269,12 @@ void loop() {
   if (now - lastFeedbackTime >= FEEDBACK_MS) {
     lastFeedbackTime = now;
     actualAngle = readActualAngleQuick();
+
+    if (USE_FAKE_ANGLE_TEST) {
+      // Override with a deliberately bad number to test the logic alone.
+      actualAngle = commandedAngle + COLLAPSE_ERROR_DEG + 5.0f;
+    }
+
     if (!systemFrozen) {
       checkScenario2Emergency();
     }
