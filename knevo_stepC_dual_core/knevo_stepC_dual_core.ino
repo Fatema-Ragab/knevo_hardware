@@ -196,7 +196,13 @@ const float COLLAPSE_ERROR_DEG = 20.0f;
 uint8_t cmdOn[5] = {0x3E, 0x88, 0x01, 0x00, 0xC7};
 
 const int TRAJ_SIZE = 11;
-const float gaitTable[TRAJ_SIZE] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+// RETIMED (this turn): breakpoints redistributed so each segment demands
+// roughly EQUAL angular speed, instead of evenly-spaced 10% steps that let
+// the 80-90% segment spike to ~3x the speed of every other segment - that
+// spike is what was causing the real actuator to lag and trip the collapse
+// check at higher presets. Same knee angle waypoints (kneeTable unchanged),
+// same total cycle time - only WHEN each transition happens shifted.
+const float gaitTable[TRAJ_SIZE] = {0, 3.3, 8.2, 13.1, 19.6, 27.8, 37.6, 49.2, 58.3, 87.7, 100};
 // DELIBERATE TRADE-OFF (confirmed tonight): original clinical curve had two
 // humps - a small early-stance flexion wave (~10-20% gait) plus the big
 // swing-phase peak (~70% gait) - matching standard gait biomechanics
