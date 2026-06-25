@@ -35,8 +35,11 @@ Notes:
 | `2` DONE | Set ended; batch frozen and ready (upload may be in progress). |
 | `3` FAULT | Safety freeze (`freezeSystem`) — **one-way latch, requires a power cycle**. |
 
-Fault codes: `0` none; `0x10` config_rejected (a `SetConfig`/`E`/`F` outside the
-allowed range — state stays IDLE, not a safety freeze).
+Fault codes (`B` / DeviceStatus): `0` none; `0x10` config_rejected (a `SetConfig`/
+`E`/`F` outside the allowed range); `0x12` upload_failed (TCP send/ACK failed after
+one retry — buffer is kept); `0x13` wifi_join_failed (couldn't join WiFi for the
+upload). All three are **recoverable** — state stays/returns to IDLE, not a safety
+freeze (only `freezeSystem` latches FAULT).
 
 ## Example bench sequences
 

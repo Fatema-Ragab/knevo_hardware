@@ -75,6 +75,11 @@ volatile uint8_t lastFaultCode = 0;   // 0 none; safety modes set this; 0x10 = c
 const uint8_t BATTERY_PCT_UNKNOWN = 0xFF;   // R5: no battery sense line on this hardware
 volatile bool setActive = false;      // true while RUNNING and Core 0 should buffer samples
 
+// WiFi/TCP net-machine state (declared early so cmdStart can refuse a new set while
+// a provisioning test or upload is still in flight).
+enum NetState : uint8_t { NET_IDLE = 0, NET_WIFI_CONNECTING = 1 };
+volatile NetState netState = NET_IDLE;
+
 // Step D forward declarations — these are called from coreBTask (Core 0) but defined
 // further down; declare them explicitly so we don't depend on Arduino's auto-prototype
 // generation (which hoists above custom types and is fragile — see handoff §7.7).
@@ -1223,6 +1228,8 @@ void requestUpload();
 
 void cmdStart(const uint8_t setId[16], uint16_t durationS) {
   if (deviceState == DEV_FAULT) return;          // never start while frozen/faulted
+  if (deviceState != DEV_IDLE) return;           // a set is already running/finishing — ignore
+  if (netState != NET_IDLE) return;              // previous upload/test still in flight (review Issue 2)
   memcpy(currentSetId, setId, 16);
   pendingStopAtExtension = false;
   fullyStoppedAtExtension = false;
@@ -1374,26 +1381,31 @@ void wifiStatusNotify(uint8_t status, uint8_t err) {   // §3.3: 0=OK, else err 
   chWifiStatus->notify();
 }
 
+volatile unsigned long uploadReqMs = 0;
+const unsigned long UPLOAD_SETTLE_TIMEOUT_MS = 8000;   // proceed even if "fully stopped" never asserts
+
 void requestUpload() {
   if (appPort == 0) { deviceState = DEV_IDLE; return; }  // Serial-only bench: nothing to upload
+  uploadReqMs = millis();
   uploadRequested = true;
 }
 
 // ---- WiFi/TCP non-blocking-ish state machine (runs on Core 0, device IDLE/DONE) ----
-enum NetState : uint8_t { NET_IDLE = 0, NET_WIFI_CONNECTING = 1 };
-NetState netState = NET_IDLE;
+// (NetState enum + netState are declared near the top so cmdStart can check them.)
 bool netForUpload = false;
 unsigned long netWifiStartMs = 0;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
-void doUpload() {
+// Returns true on a successful send + ACK. Yields between chunks so a multi-second
+// upload doesn't starve Core 0's IDLE task and trip the task watchdog (review Issue 2).
+bool doUpload() {
   WiFiClient client;
   IPAddress ip(appIp[0], appIp[1], appIp[2], appIp[3]);
   if (!client.connect(ip, appPort, 5000)) {
     xSemaphoreTake(serialMutex, portMAX_DELAY);
     Serial.println(">>> Upload: TCP connect to app failed");
     xSemaphoreGive(serialMutex);
-    return;
+    return false;
   }
   uint32_t n = bufferCount;
   uint32_t frameLen = 28 + n * SAMPLE_SIZE;   // header(28) + records
@@ -1407,16 +1419,22 @@ void doUpload() {
   wrU16(p, (uint16_t)SAMPLE_SIZE); p += 2;     // sample_size = 88  (total hdr = 32)
   client.write(hdr, 32);
   size_t total = (size_t)n * SAMPLE_SIZE, off = 0;
-  while (off < total) { size_t chunk = min((size_t)1024, total - off); client.write(sampleBuffer + off, chunk); off += chunk; }
+  while (off < total) {
+    size_t chunk = min((size_t)1024, total - off);
+    client.write(sampleBuffer + off, chunk);
+    off += chunk;
+    vTaskDelay(1);                             // yield between chunks (watchdog-safe)
+  }
   client.flush();
   unsigned long t = millis();                  // await 1-byte ACK (0x06)
-  while (!client.available() && millis() - t < 5000) delay(2);
+  while (!client.available() && millis() - t < 5000) vTaskDelay(2);
   bool acked = client.available() && (client.read() == 0x06);
   client.stop();
   xSemaphoreTake(serialMutex, portMAX_DELAY);
   Serial.print(">>> Upload sent "); Serial.print(n); Serial.print(" samples, ACK=");
   Serial.println(acked ? "yes" : "no"); if (bufferTruncated) Serial.println(">>> WARNING: buffer was truncated (set exceeded cap)");
   xSemaphoreGive(serialMutex);
+  return acked;
 }
 
 void startWifiConnect(bool forUpload) {
@@ -1430,13 +1448,19 @@ void startWifiConnect(bool forUpload) {
 void serviceNet() {
   if (netState == NET_IDLE) {
     if (wifiTestRequested) {
+      if (deviceState != DEV_IDLE) return;                           // never run a WiFi test mid-set (Issue 1) — defer
       wifiTestRequested = false;
-      if (wifiSsid[0] == 0) { wifiStatusNotify(1, 2); return; }     // 2 = ssid_not_found / not set
-      if (strcmp(wifiSsid, lastTestedSsid) == 0) { wifiStatusNotify(0, 0); return; } // already validated, skip re-test
+      if (wifiSsid[0] == 0) { wifiStatusNotify(1, 2); return; }       // 2 = ssid_not_found / not set
+      if (strcmp(wifiSsid, lastTestedSsid) == 0) { wifiStatusNotify(0, 0); return; } // already validated
       startWifiConnect(false);
     } else if (uploadRequested) {
+      if (wifiSsid[0] == 0) { uploadRequested = false; deviceState = DEV_IDLE; return; }
+      // Keep the radio OFF until the motor has physically settled — the graceful
+      // stop stride is still motion (review smaller-note). Data was already frozen
+      // at STOP; only the radio waits. A safety timeout prevents a missed settle
+      // from stranding the upload.
+      if (!fullyStoppedAtExtension && (millis() - uploadReqMs < UPLOAD_SETTLE_TIMEOUT_MS)) return;
       uploadRequested = false;
-      if (wifiSsid[0] == 0) { deviceState = DEV_IDLE; return; }
       startWifiConnect(true);
     }
     return;
@@ -1444,19 +1468,22 @@ void serviceNet() {
   // NET_WIFI_CONNECTING
   if (WiFi.status() == WL_CONNECTED) {
     if (netForUpload) {
-      doUpload();
+      bool ok = doUpload();
+      if (!ok) ok = doUpload();                                      // one retry over the live WiFi (review Issue 3)
       WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+      lastFaultCode = ok ? 0 : 0x12;                                 // 0x12 = upload_failed (recoverable; buffer kept)
       deviceState = DEV_IDLE;
+      deviceStatusNotify();
     } else {
       strncpy(lastTestedSsid, wifiSsid, sizeof(lastTestedSsid) - 1);
-      wifiStatusNotify(0, 0);                                       // provisioning OK
-      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);                   // device disconnects WiFi after the test
+      wifiStatusNotify(0, 0);                                        // provisioning OK
+      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);                    // device disconnects WiFi after the test
     }
     netState = NET_IDLE;
   } else if (millis() - netWifiStartMs > WIFI_CONNECT_TIMEOUT_MS) {
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    if (netForUpload) deviceState = DEV_IDLE;                       // upload gave up; don't strand the device
-    else wifiStatusNotify(1, 3);                                   // 3 = timeout
+    if (netForUpload) { lastFaultCode = 0x13; deviceState = DEV_IDLE; deviceStatusNotify(); } // 0x13 = wifi_join_failed
+    else wifiStatusNotify(1, 3);                                    // 3 = timeout
     netState = NET_IDLE;
   }
 }
@@ -1486,8 +1513,12 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
     uint8_t n1 = ssidLen < 32 ? ssidLen : 32; memcpy(wifiSsid, d + o, n1); wifiSsid[n1] = 0; o += ssidLen;
     uint8_t passLen = d[o++]; if (o + passLen > v.size()) return;
     uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
-    lastTestedSsid[0] = 0;                           // new creds -> force a fresh provisioning test
-    wifiTestRequested = true;                        // serviceNet() connects, tests, reports WiFiStatus
+    // Only kick off a provisioning test when IDLE — never bring WiFi up mid-set
+    // (review Issue 1). Creds are still stored above; the test just waits for idle.
+    if (deviceState == DEV_IDLE) {
+      lastTestedSsid[0] = 0;                          // new creds -> force a fresh provisioning test
+      wifiTestRequested = true;                       // serviceNet() connects, tests, reports WiFiStatus
+    }
   }
 };
 
@@ -1495,6 +1526,7 @@ class SetConfigCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     if (v.size() < 30) return;                      // 16B id + u16 dur + 3x f32
+    if (deviceState != DEV_IDLE) return;            // ignore config changes mid-set — no mid-stride ROM jump (Issue 1)
     const uint8_t* d = (const uint8_t*)v.data();
     float ms = rdF32(d + 18), me = rdF32(d + 22), mf = rdF32(d + 26);
     bool ok = (ms >= 1.0f && ms <= 12.0f)
