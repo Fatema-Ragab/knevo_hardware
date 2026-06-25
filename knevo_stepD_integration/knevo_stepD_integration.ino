@@ -1463,13 +1463,22 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
     const uint8_t* d = (const uint8_t*)v.data();
     if (v.size() < 7) return;                       // u16 port + 4B ip + u8 ssid_len + u8 pass_len minimum
     size_t o = 0;
-    appPort = rdU16(d + o); o += 2;
+    appPort = rdU16(d + o); o += 2;                 // ALWAYS refresh IP + port
     appIp[0] = d[o]; appIp[1] = d[o + 1]; appIp[2] = d[o + 2]; appIp[3] = d[o + 3]; o += 4;
-    uint8_t ssidLen = d[o++]; if (o + ssidLen + 1 > v.size()) return;
+    uint8_t ssidLen = d[o++];
+    if (ssidLen == 0) {
+      // Per-set "refresh IP/port only" write (the coordinator sends empty creds
+      // before every set): KEEP the provisioned SSID/password and do NOT re-test.
+      // Without this, the empty write would wipe the credentials provisioned
+      // earlier and the post-set WiFi upload could never connect.
+      return;
+    }
+    if (o + ssidLen + 1 > v.size()) return;
     uint8_t n1 = ssidLen < 32 ? ssidLen : 32; memcpy(wifiSsid, d + o, n1); wifiSsid[n1] = 0; o += ssidLen;
     uint8_t passLen = d[o++]; if (o + passLen > v.size()) return;
     uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
-    wifiTestRequested = true;                       // serviceNet() tests + reports WiFiStatus (skips re-test if SSID unchanged)
+    lastTestedSsid[0] = 0;                           // new creds -> force a fresh provisioning test
+    wifiTestRequested = true;                        // serviceNet() connects, tests, reports WiFiStatus
   }
 };
 
