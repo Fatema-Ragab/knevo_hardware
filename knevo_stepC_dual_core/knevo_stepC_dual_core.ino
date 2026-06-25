@@ -329,9 +329,14 @@ float readActualAngleQuick() {
   while (MotorSerial.available()) MotorSerial.read();
   MotorSerial.write(angleCmd, 5);
   MotorSerial.flush();
-  uint8_t rx[32]; int n = 0; unsigned long t = millis();
-  while (n < 32 && millis() - t < 30) {
-    if (MotorSerial.available()) { rx[n++] = MotorSerial.read(); t = millis(); }
+  uint8_t rx[32]; int n = 0;
+  unsigned long startTime = millis();  // fixed start - NOT reset per byte
+  // Previous version reset the timeout clock every time a byte arrived,
+  // so trickling bytes (e.g. under cross-core bus contention) could stall
+  // this far past the intended 30ms, spiking dt on the next gait update
+  // and triggering a freeze. This now bounds TOTAL elapsed time instead.
+  while (n < 32 && millis() - startTime < 30) {
+    if (MotorSerial.available()) { rx[n++] = MotorSerial.read(); }
   }
   for (int i = 0; i < n - 8; i++) {
     if (rx[i] == 0x3E && rx[i + 1] == 0x92) {
@@ -343,10 +348,13 @@ float readActualAngleQuick() {
   return actualAngle;
 }
 
+float lastDt = 0.0f;
+
 float getGaitPercentInput() {
   unsigned long now = millis();
   if (lastGaitUpdateTime == 0) { lastGaitUpdateTime = now; return Gait_percent; }
   float dt = (now - lastGaitUpdateTime) / 1000.0f;
+  lastDt = dt;
   lastGaitUpdateTime = now;
   float step = simGaitSpeedPercentPerSec * dt;
   Gait_percent = wrapGaitPercent(Gait_percent + step);
@@ -369,8 +377,20 @@ float validateOrPredictGait(float newGaitPercent) {
     return newGaitPercent;
   }
   badReading = true; badReadingCounter++;
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.print(">>> BAD READING #"); Serial.print(badReadingCounter);
+  Serial.print(" dt="); Serial.print(lastDt * 1000.0f, 1); Serial.print("ms");
+  Serial.print(" jump="); Serial.print(jump, 2);
+  Serial.print(" from="); Serial.print(lastValidGaitPercent, 2);
+  Serial.print(" to="); Serial.println(newGaitPercent, 2);
+  xSemaphoreGive(serialMutex);
   predictedGaitPercent = wrapGaitPercent(predictedGaitPercent + gaitRatePerUpdate);
-  if (badReadingCounter > MAX_BAD_READINGS) freezeSystem(2);
+  if (badReadingCounter > MAX_BAD_READINGS) {
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    Serial.println(">>> FREEZE: triggered from accumulated bad readings (validateOrPredictGait) <<<");
+    xSemaphoreGive(serialMutex);
+    freezeSystem(2);
+  }
   return predictedGaitPercent;
 }
 
@@ -393,7 +413,13 @@ void sendMotorSmoothly() {
 
 void checkScenario2Emergency() {
   if (supportMode == 1) {
-    if (actualAngle > commandedAngle + COLLAPSE_ERROR_DEG) freezeSystem(2);
+    if (actualAngle > commandedAngle + COLLAPSE_ERROR_DEG) {
+      xSemaphoreTake(serialMutex, portMAX_DELAY);
+      Serial.print(">>> FREEZE: triggered from checkScenario2Emergency, actualAngle=");
+      Serial.print(actualAngle, 1); Serial.print(" commandedAngle="); Serial.println(commandedAngle, 1);
+      xSemaphoreGive(serialMutex);
+      freezeSystem(2);
+    }
   }
 }
 
