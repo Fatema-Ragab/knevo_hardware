@@ -144,14 +144,30 @@ const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
   {71.7f,  "1.39s cycle - 1.75 mph"                                    },
   {74.5f,  "1.34s cycle - 2.00 mph (fastest real dataset speed)"       },
 };
-float simGaitSpeedPercentPerSec = SPEED_PRESETS[0].percentPerSec;  // start at slowest, per request
+// Ramp: speed changes (including the very first start) now ease in/out
+// instead of jumping instantly. MAX_SPEED_ACCEL_PER_SEC is sized so the
+// FULL range (0 -> fastest preset, 74.5) takes ~5s; smaller changes
+// between two non-zero presets ramp proportionally faster.
+const float MAX_SPEED_ACCEL_PER_SEC = 74.5f / 5.0f;  // ~14.9 (%/s) per second
+float targetSpeedPercentPerSec = SPEED_PRESETS[0].percentPerSec;  // aim at slowest preset on boot
+float simGaitSpeedPercentPerSec = 0.0f;  // CURRENT speed - starts at 0, ramps up to target
 int currentSpeedPresetIndex = 1;
+
+void updateSpeedRamp(float dt) {
+  float maxStep = MAX_SPEED_ACCEL_PER_SEC * dt;
+  float diff = targetSpeedPercentPerSec - simGaitSpeedPercentPerSec;
+  if (diff > maxStep) diff = maxStep;
+  else if (diff < -maxStep) diff = -maxStep;
+  simGaitSpeedPercentPerSec += diff;
+}
 
 void printSpeedMenu() {
   Serial.println("=== SPEED PRESETS (type the number + Enter in Serial Monitor to switch) ===");
+  Serial.println("0: STOP (ramps down to zero, ~5s for the full range)");
   for (int i = 0; i < NUM_SPEED_PRESETS; i++) {
     Serial.print(i + 1); Serial.print(": "); Serial.println(SPEED_PRESETS[i].label);
   }
+  Serial.println("Speed changes ease in/out over ~5s (full range) - not instant.");
   Serial.println("============================================================================");
 }
 
@@ -172,13 +188,17 @@ void checkSpeedCommand() {
       if (speedInputBuffer.length() > 0) {
         int idx = speedInputBuffer.toInt();
         xSemaphoreTake(serialMutex, portMAX_DELAY);
-        if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
+        if (idx == 0) {
+          targetSpeedPercentPerSec = 0.0f;
+          Serial.println(">>> Target: STOP (0) - ramping down <<<");
+        } else if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
           currentSpeedPresetIndex = idx;
-          simGaitSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
-          Serial.print(">>> Preset "); Serial.print(idx); Serial.print(": ");
-          Serial.println(SPEED_PRESETS[idx - 1].label);
+          targetSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
+          Serial.print(">>> Target preset "); Serial.print(idx); Serial.print(": ");
+          Serial.print(SPEED_PRESETS[idx - 1].label);
+          Serial.println(" - ramping <<<");
         } else {
-          Serial.println(">>> Invalid. Type a number 1-12 and press Enter.");
+          Serial.println(">>> Invalid. Type 0 (stop) or 1-12 and press Enter.");
         }
         xSemaphoreGive(serialMutex);
         speedInputBuffer = "";
@@ -362,6 +382,7 @@ float getGaitPercentInput() {
   float dt = (now - lastGaitUpdateTime) / 1000.0f;
   lastDt = dt;
   lastGaitUpdateTime = now;
+  updateSpeedRamp(dt);
   float step = simGaitSpeedPercentPerSec * dt;
   Gait_percent = wrapGaitPercent(Gait_percent + step);
   return Gait_percent;
@@ -986,7 +1007,7 @@ void setup() {
 
   Serial.println("=== KNEVO STEP C: DUAL-CORE INTEGRATION ===");
   Serial.println("Core 1 = Step A (open-loop control, worn). Core 0 = Step B (sensor+DL, logging only).");
-  Serial.print("Simulated gait cycle length: "); Serial.print(100.0f / simGaitSpeedPercentPerSec, 2); Serial.println(" s");
+  Serial.print("Target gait cycle length: "); Serial.print(100.0f / targetSpeedPercentPerSec, 2); Serial.println(" s (ramping up from a stop)");
   printSpeedMenu();
 
   if (motorOn()) { Serial.println("Motor ON confirmed"); }
@@ -1012,10 +1033,28 @@ void setup() {
 }
 
 // Runs on Core 1 (default Arduino loop core). This is Step A, unchanged.
+unsigned long lastSpeedPrintTime = 0;
+const unsigned long SPEED_PRINT_MS = 250;  // 4x/sec - enough resolution to watch a ~5s ramp clearly
+
+void printSpeedStatus() {
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.print("[SPEED] current="); Serial.print(simGaitSpeedPercentPerSec, 1);
+  Serial.print(" target="); Serial.print(targetSpeedPercentPerSec, 1);
+  Serial.print(" cycle=");
+  if (simGaitSpeedPercentPerSec > 0.01f) { Serial.print(100.0f / simGaitSpeedPercentPerSec, 2); Serial.println("s"); }
+  else { Serial.println("stopped"); }
+  xSemaphoreGive(serialMutex);
+}
+
 void loop() {
   unsigned long now = millis();
 
   checkSpeedCommand();
+
+  if (now - lastSpeedPrintTime >= SPEED_PRINT_MS) {
+    lastSpeedPrintTime = now;
+    printSpeedStatus();
+  }
 
   if (now - lastControlTime >= CONTROL_MS) {
     lastControlTime = now;
