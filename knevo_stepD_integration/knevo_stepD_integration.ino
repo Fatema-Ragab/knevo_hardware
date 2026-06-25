@@ -234,7 +234,7 @@ void printSpeedMenu() {
   for (int i = 0; i < NUM_SPEED_PRESETS; i++) {
     Serial.print(i + 1); Serial.print(": "); Serial.println(SPEED_PRESETS[i].label);
   }
-  Serial.println("Speed changes step through the presets one at a time, 1 per second.");
+  Serial.println("A speed (1-12) only CONFIGURES the preset; the motor moves on START, not before.");
   Serial.println("--- Step D session/config commands (same actions the app drives over BLE) ---");
   Serial.println("E<deg> : set max extension (1-5)      F<deg> : set max flexion (30-65)");
   Serial.println("CU     : calibrate UNLOADED (idle)    CS     : calibrate STATIC (idle)");
@@ -300,8 +300,8 @@ void checkSpeedCommand() {
           int idx = s.toInt();
           if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
             cmdSetSpeedIndex(idx);
-            Serial.print(">>> Target preset "); Serial.print(idx); Serial.print(": ");
-            Serial.print(SPEED_PRESETS[idx - 1].label); Serial.println(" - stepping 1 preset/sec <<<");
+            Serial.print(">>> Speed configured: preset "); Serial.print(idx); Serial.print(" (");
+            Serial.print(SPEED_PRESETS[idx - 1].label); Serial.println(") - applies on START (G), motor stays at rest <<<");
           } else {
             Serial.println(">>> Invalid. 0=stop, 1-12=speed, E<deg>, F<deg>, CU/CS=calibrate, G<sec>=start set");
           }
@@ -1200,12 +1200,15 @@ int speedIndexFromMaxSpeed(float maxSpeed) {     // R2: contract max_speed -> pr
   return idx;
 }
 
+// Speed is CONFIGURATION ONLY: it records the preset to use, but does NOT move the
+// motor or change the device state. The motor only moves on START (which applies
+// sessionSpeedIndex). Each config command is independent — speed does not touch
+// duration/ROM, and configuring speed never starts a set. (STOP, by contrast, is an
+// immediate action handled by cmdStop, not by this function.)
 void cmdSetSpeedIndex(int idx) {
   if (idx < 1) idx = 1;
   if (idx > NUM_SPEED_PRESETS) idx = NUM_SPEED_PRESETS;
-  pendingStopAtExtension = false;
-  fullyStoppedAtExtension = false;
-  targetSpeedIndexUser = idx;
+  sessionSpeedIndex = idx;
 }
 
 bool cmdSetExtension(float deg) {                // returns false if out of contract range
