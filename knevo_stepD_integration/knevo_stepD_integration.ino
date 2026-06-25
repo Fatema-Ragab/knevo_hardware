@@ -44,6 +44,7 @@
 #include <Wire.h>
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>   // esp_timer_get_time() for monotonic per-sample timestamps
 
 // Step D — mobile-contract integration.
 // NimBLE-Arduino (install via Library Manager; tested against the 1.4.x API).
@@ -66,6 +67,30 @@
 #include "knevo_esp32_boosted_phase_cnn_scaler.h"
 
 SemaphoreHandle_t serialMutex;
+
+// ---- Step D device state (declared early: freezeSystem() below reports FAULT) ----
+enum DeviceState : uint8_t { DEV_IDLE = 0, DEV_RUNNING = 1, DEV_DONE = 2, DEV_FAULT = 3 };
+volatile DeviceState deviceState = DEV_IDLE;
+volatile uint8_t lastFaultCode = 0;   // 0 none; safety modes set this; 0x10 = config_rejected (D-ext1.6)
+const uint8_t BATTERY_PCT_UNKNOWN = 0xFF;   // R5: no battery sense line on this hardware
+volatile bool setActive = false;      // true while RUNNING and Core 0 should buffer samples
+
+// Step D forward declarations — these are called from coreBTask (Core 0) but defined
+// further down; declare them explicitly so we don't depend on Arduino's auto-prototype
+// generation (which hoists above custom types and is fragile — see handoff §7.7).
+void serviceCalibration(int heelRaw, int midRaw);
+void appendSample(uint64_t ts_us, float ax_g[3], float ay_g[3], float az_g[3],
+                  float gx_rs[3], float gy_rs[3], float gz_rs[3], uint16_t heelRaw, uint16_t midRaw);
+void serviceNet();
+void deviceStatusNotify();
+// Command API (called from checkSpeedCommand on Core 1; defined in the Step D section).
+void cmdSetSpeedIndex(int idx);
+bool cmdSetExtension(float deg);
+bool cmdSetFlexion(float deg);
+void cmdStart(const uint8_t setId[16], uint16_t durationS);
+void cmdStop();
+void cmdCalibrateUnloaded();
+void cmdCalibrateStatic();
 
 // ============================================================
 // SHARED: built-in RGB LED (was duplicated in A and B - one copy)
@@ -167,12 +192,12 @@ const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
 // per second toward the target - no continuous interpolation, no fixed
 // 5s ramp. 0 is treated as a 13th step, below preset 1, for a full stop.
 const unsigned long SPEED_STEP_MS = 1000;  // one preset step per second
-int currentSpeedIndex = 0;       // 0 = stop, 1-12 = SPEED_PRESETS index; starts stopped
-int targetSpeedIndexUser = 1;    // boots aiming at preset 1
+int currentSpeedIndex = 0;       // 0 = stop, 1-12 = SPEED_PRESETS index; starts stopped (Core 1 only)
+volatile int targetSpeedIndexUser = 1;    // boots aiming at preset 1 (Step D: now written from BLE too)
 unsigned long lastSpeedStepTime = 0;
 float simGaitSpeedPercentPerSec = 0.0f;  // current actual speed, derived from currentSpeedIndex
-bool pendingStopAtExtension = false;  // true while decelerating toward a full stop
-bool fullyStoppedAtExtension = false; // true once actually resting at full extension
+volatile bool pendingStopAtExtension = false;  // true while decelerating toward a full stop (cross-core)
+volatile bool fullyStoppedAtExtension = false; // true once actually resting at full extension (cross-core)
 
 float speedForIndex(int idx) {
   if (idx <= 0) return 0.0f;
@@ -237,6 +262,14 @@ void checkSpeedCommand() {
         } else if (up == "CS") {                        // calibrate STATIC (step 2)
           cmdCalibrateStatic();
           Serial.println(deviceState == DEV_IDLE ? ">>> Calibrate STATIC requested" : ">>> Ignored: device must be IDLE to calibrate");
+        } else if (up == "B") {                         // B -> dump device/session state (bench diagnostic)
+          Serial.print(">>> [STATE] dev="); Serial.print((int)deviceState);
+          Serial.print(" fault=0x"); Serial.print(lastFaultCode, HEX);
+          Serial.print(" buffer="); Serial.print(bufferCount);
+          Serial.print(" ext="); Serial.print(THERAPIST_MIN_ROM_DEG, 1);
+          Serial.print(" flex="); Serial.print(THERAPIST_MAX_ROM_DEG, 1);
+          Serial.print(" spdIdx="); Serial.print(sessionSpeedIndex);
+          Serial.print(" wifiPort="); Serial.println(appPort);
         } else if (up.startsWith("G")) {                // G<sec> -> start a bench set (0 = no auto-stop)
           uint16_t dur = (uint16_t)s.substring(1).toInt();
           uint8_t benchId[16]; for (int i = 0; i < 16; i++) benchId[i] = (uint8_t)(i + 1);
@@ -376,6 +409,12 @@ void freezeSystem(int emergencyMode) {
   supportMode = emergencyMode;
   frozenAngle = commandedAngle;
   ledFrozenBlue();
+  // Step D: surface the (one-way, hardware-truth) safety latch as DeviceState FAULT.
+  // This is separate from the transient config_rejected code (0x10) and, like the
+  // latch itself, is only cleared by a power cycle.
+  deviceState = DEV_FAULT;
+  lastFaultCode = (uint8_t)emergencyMode;
+  setActive = false;
 }
 
 void sendCmd(uint8_t* cmd, int len) {
@@ -967,7 +1006,10 @@ void setupStepB() {
   if (allIMUsOK()) { Serial.println("All IMUs OK."); }
   else { Serial.println("One or more IMUs FAILED - features will be wrong until fixed."); }
 
-  calibrateFSR();
+  // Step D: FSR calibration is now ON-DEMAND and non-blocking (Serial CU/CS or the
+  // app's BLE calibration opcodes), not a blocking boot step. Until calibrated, the
+  // FSR bounds keep their full-range defaults (heel/mid Low=0, High=4095). The old
+  // blocking calibrateFSR() is retained below for reference but no longer called.
 
   for (int f = 0; f < KNEVO_TCN_FEATURE_COUNT; f++) {
     if (KNEVO_TCN_STD[f] == 0.0f) { q_mult[f] = 0.0f; q_bias[f] = KNEVO_TCN_INPUT_ZERO_POINT; }
@@ -1040,6 +1082,14 @@ void coreBTask(void* pvParameters) {
       float heelNorm = normalize01(heelRaw, heelLow, heelHigh);
       float midNorm  = normalize01(midRaw, midLow, midHigh);
 
+      // Step D: drive on-demand calibration, and buffer raw samples while a set runs.
+      serviceCalibration(heelRaw, midRaw);
+      if (setActive) {
+        appendSample((uint64_t)esp_timer_get_time(),
+                     ax_g, ay_g, az_g, gx_rs, gy_rs, gz_rs,
+                     (uint16_t)heelRaw, (uint16_t)midRaw);
+      }
+
       uint32_t t_feat_start = micros();
       updateHeelStrikeTracker(heelNorm, midNorm);
       computeFeatures(ax_g, ay_g, az_g, gx_rs, gy_rs, gz_rs, heelNorm, midNorm);
@@ -1064,6 +1114,7 @@ void coreBTask(void* pvParameters) {
 
     if (millis() - lastHumanPrintTime_B >= 1000) {
       lastHumanPrintTime_B = millis();
+      deviceStatusNotify();   // Step D: periodic DeviceStatus push (also covers Serial-driven state changes)
       xSemaphoreTake(serialMutex, portMAX_DELAY);
       Serial.print("[STATUS-B] Hz="); Serial.print(achievedHz, 1);
       Serial.print(" TrackerProgress="); Serial.print(trackerGaitFrac * 100.0f, 1);
@@ -1078,6 +1129,11 @@ void coreBTask(void* pvParameters) {
       Serial.print(" Feature="); Serial.print(last_feature_us); Serial.println("us");
       xSemaphoreGive(serialMutex);
     }
+
+    // Step D: WiFi provisioning-test / post-set upload state machine. Only does real
+    // work when a request is pending (device IDLE or DONE) - never during a RUNNING set,
+    // so it cannot disturb buffering or Core 1's motor loop.
+    serviceNet();
 
     vTaskDelay(1);  // yield - prevents watchdog trip, negligible vs. the workload above
   }
@@ -1098,19 +1154,16 @@ void coreBTask(void* pvParameters) {
    in BLE callbacks and on Core 0; handlers only set flags, never block.
    ============================================================ */
 
-// ---- Device state machine (source for BLE DeviceStatus) ----
-enum DeviceState : uint8_t { DEV_IDLE = 0, DEV_RUNNING = 1, DEV_DONE = 2, DEV_FAULT = 3 };
-volatile DeviceState deviceState = DEV_IDLE;
-volatile uint8_t lastFaultCode = 0;   // 0 none; (reserved M13: 1 e_stop, 2 rom_exceeded, ...); 0x10 = config_rejected (D-ext1.6)
-const uint8_t BATTERY_PCT_UNKNOWN = 0xFF;   // R5: no battery sense line on this hardware
+// (DeviceState enum + deviceState/lastFaultCode/BATTERY_PCT_UNKNOWN declared near the
+// top of the file so freezeSystem() can report FAULT.)
 
 // ---- Shared session state (written by the command API, read by both cores) ----
-volatile bool setActive = false;          // true while RUNNING and Core 0 should buffer
+// (setActive declared near the top so freezeSystem() can clear it.)
 uint8_t currentSetId[16] = {0};            // from SetConfig, echoed in the TCP frame header
-int sessionSpeedIndex = 5;                 // resolved from SetConfig.max_speed (1..12)
+volatile int sessionSpeedIndex = 5;        // resolved from SetConfig.max_speed (1..12)
 volatile bool durationActive = false;
-unsigned long sessionStartMs = 0;
-unsigned long sessionDurationMs = 0;       // 0 = no auto-stop
+volatile unsigned long sessionStartMs = 0;
+volatile unsigned long sessionDurationMs = 0;  // 0 = no auto-stop
 
 // ---- Non-blocking calibration state machine (Core 0) ----
 // Replaces the old blocking calibrateFSR(). Two independently-triggerable,
@@ -1221,6 +1274,273 @@ void serviceCalibration(int heelRaw, int midRaw) {
 }
 
 /* ============================================================
+   =========   STEP D — BLE GATT + WiFi/TCP DATA PLANE   ========
+   ============================================================
+   Byte layouts here are byte-for-byte mirrors of the iOS reference
+   (KnevoPatient/.../Bluetooth/KnevoCodec.swift). All multi-byte fields
+   are little-endian. Serialization is explicit (no packed-struct casts)
+   to avoid alignment-padding drift (gap-analysis §5.1).
+   ============================================================ */
+
+// GATT UUIDs (verbatim from the agreed contract / KnevoGATT.swift)
+#define KNEVO_SVC_UUID        "94A4B5CC-14F9-40BF-9631-62954DC8D647"
+#define KNEVO_WIFICONFIG_UUID "A4F7B9FF-AC9E-4171-A9FF-461F1180F124"
+#define KNEVO_WIFISTATUS_UUID "23F1E73A-68CD-4D6A-85DC-B33BA4ED6153"
+#define KNEVO_SETCONFIG_UUID  "4FCD372C-910F-46B1-94AB-F3C06597EB60"
+#define KNEVO_CONTROL_UUID    "93413C6D-977F-490B-AEC3-AF800C18FFA9"
+#define KNEVO_DEVSTATUS_UUID  "0439E3D3-AA83-4A13-8AE4-CE19AB85B832"
+#define KNEVO_BLE_NAME        "knevo_exo"   // must keep the knevo_ prefix the app scans for
+
+const char* FIRMWARE_VERSION = "knevo-stepD-1.0";
+
+#define OP_START        0x01
+#define OP_STOP         0x02
+#define OP_CAL_UNLOADED 0x10
+#define OP_CAL_STATIC   0x11
+
+// ---- little-endian writers / readers ----
+static inline void wrU16(uint8_t* p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
+static inline void wrU32(uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (v >> (8 * i)) & 0xFF; }
+static inline void wrU64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (v >> (8 * i)) & 0xFF; }
+static inline void wrF32(uint8_t* p, float f) { uint32_t b; memcpy(&b, &f, 4); wrU32(p, b); }
+static inline uint16_t rdU16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static inline float rdF32(const uint8_t* p) {
+  uint32_t b = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  float f; memcpy(&f, &b, 4); return f;
+}
+
+// ---- Sample buffer (PSRAM); records pre-serialized in the 88-byte contract layout ----
+const int SAMPLE_SIZE = 88;
+const uint32_t MAX_BUFFER_SAMPLES = 20000;   // ~1.76 MB PSRAM; minutes at the real ~16-91 Hz rate
+uint8_t* sampleBuffer = nullptr;
+volatile uint32_t bufferCount = 0;
+volatile bool bufferTruncated = false;
+uint32_t sampleSeq = 0;
+
+void bufferReset() { bufferCount = 0; bufferTruncated = false; sampleSeq = 0; }  // flags/memory only, no mutex/print
+
+// Called from Core 0 each sensor tick while a set is active. Record layout matches
+// KnevoCodec.encodeSensorBatch: u64 ts, u32 sample_id, 18x f32 (foot/shank/thigh
+// each ax,ay,az,gx,gy,gz), u16 heel_raw, u16 mid_raw.
+void appendSample(uint64_t ts_us,
+                  float ax_g[3], float ay_g[3], float az_g[3],
+                  float gx_rs[3], float gy_rs[3], float gz_rs[3],
+                  uint16_t heelRaw, uint16_t midRaw) {
+  if (sampleBuffer == nullptr) return;
+  if (bufferCount >= MAX_BUFFER_SAMPLES) { bufferTruncated = true; return; }
+  uint8_t* p = sampleBuffer + (size_t)bufferCount * SAMPLE_SIZE;
+  wrU64(p, ts_us); p += 8;
+  wrU32(p, sampleSeq++); p += 4;
+  for (int i = 0; i < 3; i++) {   // foot(0), shank(1), thigh(2)
+    wrF32(p, ax_g[i]);  p += 4; wrF32(p, ay_g[i]);  p += 4; wrF32(p, az_g[i]);  p += 4;
+    wrF32(p, gx_rs[i]); p += 4; wrF32(p, gy_rs[i]); p += 4; wrF32(p, gz_rs[i]); p += 4;
+  }
+  wrU16(p, heelRaw); p += 2; wrU16(p, midRaw); p += 2;
+  bufferCount++;
+}
+
+// ---- WiFi provisioning state (from WiFiConfig writes) ----
+char     wifiSsid[33] = {0};
+char     wifiPass[64] = {0};
+uint8_t  appIp[4]     = {0, 0, 0, 0};
+uint16_t appPort      = 0;            // 0 => not provisioned (Serial-only mode skips upload)
+char     lastTestedSsid[33] = {0};
+volatile bool wifiTestRequested = false;   // provisioning connection test
+volatile bool uploadRequested   = false;   // post-set batch upload
+
+// ---- BLE characteristic handles + notify helpers ----
+NimBLECharacteristic* chWifiStatus = nullptr;
+NimBLECharacteristic* chDevStatus  = nullptr;
+
+void deviceStatusNotify() {
+  if (!chDevStatus) return;
+  uint8_t b[3] = { (uint8_t)deviceState, BATTERY_PCT_UNKNOWN, lastFaultCode };  // §3.5: state, battery, fault
+  chDevStatus->setValue(b, 3);
+  chDevStatus->notify();
+}
+void wifiStatusNotify(uint8_t status, uint8_t err) {   // §3.3: 0=OK, else err code
+  if (!chWifiStatus) return;
+  uint8_t b[2] = { status, err };
+  chWifiStatus->setValue(b, 2);
+  chWifiStatus->notify();
+}
+
+void requestUpload() {
+  if (appPort == 0) { deviceState = DEV_IDLE; return; }  // Serial-only bench: nothing to upload
+  uploadRequested = true;
+}
+
+// ---- WiFi/TCP non-blocking-ish state machine (runs on Core 0, device IDLE/DONE) ----
+enum NetState : uint8_t { NET_IDLE = 0, NET_WIFI_CONNECTING = 1 };
+NetState netState = NET_IDLE;
+bool netForUpload = false;
+unsigned long netWifiStartMs = 0;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+
+void doUpload() {
+  WiFiClient client;
+  IPAddress ip(appIp[0], appIp[1], appIp[2], appIp[3]);
+  if (!client.connect(ip, appPort, 5000)) {
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    Serial.println(">>> Upload: TCP connect to app failed");
+    xSemaphoreGive(serialMutex);
+    return;
+  }
+  uint32_t n = bufferCount;
+  uint32_t frameLen = 28 + n * SAMPLE_SIZE;   // header(28) + records
+  uint8_t hdr[32]; uint8_t* p = hdr;
+  wrU32(p, frameLen); p += 4;                 // 4-byte length prefix
+  memcpy(p, "KNVO", 4); p += 4;
+  *p++ = 1;                                    // version
+  *p++ = 0;                                    // flags
+  memcpy(p, currentSetId, 16); p += 16;
+  wrU32(p, n); p += 4;                         // sample_count
+  wrU16(p, (uint16_t)SAMPLE_SIZE); p += 2;     // sample_size = 88  (total hdr = 32)
+  client.write(hdr, 32);
+  size_t total = (size_t)n * SAMPLE_SIZE, off = 0;
+  while (off < total) { size_t chunk = min((size_t)1024, total - off); client.write(sampleBuffer + off, chunk); off += chunk; }
+  client.flush();
+  unsigned long t = millis();                  // await 1-byte ACK (0x06)
+  while (!client.available() && millis() - t < 5000) delay(2);
+  bool acked = client.available() && (client.read() == 0x06);
+  client.stop();
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.print(">>> Upload sent "); Serial.print(n); Serial.print(" samples, ACK=");
+  Serial.println(acked ? "yes" : "no"); if (bufferTruncated) Serial.println(">>> WARNING: buffer was truncated (set exceeded cap)");
+  xSemaphoreGive(serialMutex);
+}
+
+void startWifiConnect(bool forUpload) {
+  netForUpload = forUpload;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid, wifiPass);
+  netWifiStartMs = millis();
+  netState = NET_WIFI_CONNECTING;
+}
+
+void serviceNet() {
+  if (netState == NET_IDLE) {
+    if (wifiTestRequested) {
+      wifiTestRequested = false;
+      if (wifiSsid[0] == 0) { wifiStatusNotify(1, 2); return; }     // 2 = ssid_not_found / not set
+      if (strcmp(wifiSsid, lastTestedSsid) == 0) { wifiStatusNotify(0, 0); return; } // already validated, skip re-test
+      startWifiConnect(false);
+    } else if (uploadRequested) {
+      uploadRequested = false;
+      if (wifiSsid[0] == 0) { deviceState = DEV_IDLE; return; }
+      startWifiConnect(true);
+    }
+    return;
+  }
+  // NET_WIFI_CONNECTING
+  if (WiFi.status() == WL_CONNECTED) {
+    if (netForUpload) {
+      doUpload();
+      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+      deviceState = DEV_IDLE;
+    } else {
+      strncpy(lastTestedSsid, wifiSsid, sizeof(lastTestedSsid) - 1);
+      wifiStatusNotify(0, 0);                                       // provisioning OK
+      WiFi.disconnect(true); WiFi.mode(WIFI_OFF);                   // device disconnects WiFi after the test
+    }
+    netState = NET_IDLE;
+  } else if (millis() - netWifiStartMs > WIFI_CONNECT_TIMEOUT_MS) {
+    WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+    if (netForUpload) deviceState = DEV_IDLE;                       // upload gave up; don't strand the device
+    else wifiStatusNotify(1, 3);                                   // 3 = timeout
+    netState = NET_IDLE;
+  }
+}
+
+// ---- BLE write-handler state shared with Control START ----
+uint8_t  pendingSetId[16] = {0};
+uint16_t pendingDurationS = 0;
+
+// ---- NimBLE characteristic callbacks (tiny, non-blocking: parse + set flags only) ----
+class WiFiConfigCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    const uint8_t* d = (const uint8_t*)v.data();
+    if (v.size() < 7) return;                       // u16 port + 4B ip + u8 ssid_len + u8 pass_len minimum
+    size_t o = 0;
+    appPort = rdU16(d + o); o += 2;
+    appIp[0] = d[o]; appIp[1] = d[o + 1]; appIp[2] = d[o + 2]; appIp[3] = d[o + 3]; o += 4;
+    uint8_t ssidLen = d[o++]; if (o + ssidLen + 1 > v.size()) return;
+    uint8_t n1 = ssidLen < 32 ? ssidLen : 32; memcpy(wifiSsid, d + o, n1); wifiSsid[n1] = 0; o += ssidLen;
+    uint8_t passLen = d[o++]; if (o + passLen > v.size()) return;
+    uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
+    wifiTestRequested = true;                       // serviceNet() tests + reports WiFiStatus (skips re-test if SSID unchanged)
+  }
+};
+
+class SetConfigCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (v.size() < 30) return;                      // 16B id + u16 dur + 3x f32
+    const uint8_t* d = (const uint8_t*)v.data();
+    float ms = rdF32(d + 18), me = rdF32(d + 22), mf = rdF32(d + 26);
+    bool ok = (ms >= 1.0f && ms <= 12.0f)
+           && (me >= CONTRACT_EXT_MIN_DEG && me <= CONTRACT_EXT_MAX_DEG)
+           && (mf >= CONTRACT_FLEX_MIN_DEG && mf <= CONTRACT_FLEX_MAX_DEG)
+           && (me < mf);
+    if (!ok) {                                      // D-ext1.6: reject out-of-range, do NOT start
+      lastFaultCode = 0x10;                         // config_rejected (NOT the safety latch; state stays IDLE)
+      deviceStatusNotify();
+      return;
+    }
+    memcpy(pendingSetId, d, 16);
+    pendingDurationS = rdU16(d + 16);
+    sessionSpeedIndex = speedIndexFromMaxSpeed(ms);
+    cmdSetExtension(me);
+    cmdSetFlexion(mf);
+    lastFaultCode = 0;
+    deviceStatusNotify();
+  }
+};
+
+class ControlCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (v.size() < 1) return;
+    switch ((uint8_t)v[0]) {
+      case OP_START:        cmdStart(pendingSetId, pendingDurationS); break;
+      case OP_STOP:         cmdStop(); break;
+      case OP_CAL_UNLOADED: cmdCalibrateUnloaded(); break;
+      case OP_CAL_STATIC:   cmdCalibrateStatic(); break;
+      default: return;
+    }
+    deviceStatusNotify();
+  }
+};
+
+void bleSetup() {
+  NimBLEDevice::init(KNEVO_BLE_NAME);
+  NimBLEServer* server = NimBLEDevice::createServer();
+  NimBLEService* svc = server->createService(KNEVO_SVC_UUID);
+
+  NimBLECharacteristic* chWifiCfg = svc->createCharacteristic(KNEVO_WIFICONFIG_UUID, NIMBLE_PROPERTY::WRITE);
+  chWifiCfg->setCallbacks(new WiFiConfigCB());
+
+  chWifiStatus = svc->createCharacteristic(KNEVO_WIFISTATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+  NimBLECharacteristic* chSetCfg = svc->createCharacteristic(KNEVO_SETCONFIG_UUID, NIMBLE_PROPERTY::WRITE);
+  chSetCfg->setCallbacks(new SetConfigCB());
+
+  NimBLECharacteristic* chControl = svc->createCharacteristic(KNEVO_CONTROL_UUID, NIMBLE_PROPERTY::WRITE);
+  chControl->setCallbacks(new ControlCB());
+
+  chDevStatus = svc->createCharacteristic(KNEVO_DEVSTATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  uint8_t initStatus[3] = { (uint8_t)deviceState, BATTERY_PCT_UNKNOWN, 0 };
+  chDevStatus->setValue(initStatus, 3);
+
+  svc->start();
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(KNEVO_SVC_UUID);     // the app scans/filters by this service UUID
+  adv->setScanResponse(true);
+  NimBLEDevice::startAdvertising();
+}
+
+/* ============================================================
    ===================   SETUP / LOOP   ========================
    ============================================================ */
 
@@ -1241,6 +1561,14 @@ void setup() {
 
   // Step B's full setup must complete before its task starts.
   setupStepB();
+
+  // Step D: PSRAM sample buffer + BLE peripheral, before Core 0's task starts using them.
+  size_t bufBytes = (size_t)MAX_BUFFER_SAMPLES * SAMPLE_SIZE;
+  sampleBuffer = (uint8_t*)heap_caps_malloc(bufBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!sampleBuffer) Serial.println("WARNING: PSRAM sample buffer alloc failed - session upload disabled until fixed.");
+  else { Serial.print("Sample buffer: "); Serial.print(bufBytes / 1024); Serial.println(" KB in PSRAM."); }
+  bleSetup();
+  Serial.println("BLE advertising as '" KNEVO_BLE_NAME "'.");
 
   serialMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(coreBTask, "CoreB_SensorDL", 16384, NULL, 1, NULL, 0);
@@ -1281,6 +1609,11 @@ void loop() {
 
   checkSpeedCommand();
   updateSpeedStepping();
+
+  // Step D (D6): session duration elapsed -> the SAME stop path as a manual STOP.
+  if (durationActive && (millis() - sessionStartMs >= sessionDurationMs)) {
+    cmdStop();
+  }
 
   if (now - lastSpeedPrintTime >= SPEED_PRINT_MS) {
     lastSpeedPrintTime = now;
