@@ -79,6 +79,8 @@ This is considered essential infrastructure regardless of shadow-mode status —
 
 ## 4. Today's Build & Test Plan
 
+**UPDATE (later same night):** Steps 0–2 below were executed and surfaced real bugs in the heel-strike tracker (median contamination from sparse test presses, a jump-validation/reset mismatch that caused false freezes). Given the live-demo deadline, the plan was deliberately revised: the tracker was pulled out of the motor's control path entirely. See §7 for the current plan (Steps A/B/C), which supersedes Steps 3–5 below. Steps 0–2's bug fixes and lessons (debounce, gap-timeout, reset-bypass) remain valid and are reused inside Step B.
+
 Approach: **step-by-step, gated** — confirm each step actually works before moving to the next, so any failure is easy to isolate.
 
 **Step 0 — Verify the safety path alone, before anything new touches it.**
@@ -90,13 +92,11 @@ Real-time `Gait_percent` from live IMU/FSR sensors, implementing Decision #1's G
 **Step 2 — Wire the tracker into the existing control loop.**
 Replace `moresmoother.ino`'s simulated `getGaitPercentInput()` with Step 1's real tracker output. Bench-test the motor (not worn): confirm smoothing, look-ahead, and jump-rejection still behave correctly against real noisy input instead of the clean sine wave it was tested against before.
 
-**Step 3 — Dual-core bring-up, CNN in shadow mode.**
-Core A (sensors/tracker/spline/motor) pinned, strict 10ms loop. Core B (CNN) using the real causal feature recipe from Decision #1, running window+inference whenever free, logging its result and comparing it to the tracker's FSM bin via the double-buffer handoff. `aiCorrectionEnabled = false`. Test: confirm Core A's 10ms timing holds steady regardless of Core B's load.
+**Step 3 — ~~Dual-core bring-up, CNN in shadow mode~~ (superseded, see §7 Step C).**
 
-**Step 4 — First worn test, conservative settings.**
-Small ROM, cautious `THERAPIST_MAX_ROM_DEG`, spotter present. Confirm: freeze path still works while worn, motion is smooth, CNN's logged output looks reasonable next to the tracker.
+**Step 4 — ~~First worn test~~ (superseded — see §7; worn testing now happens on the open-loop Step A firmware, not the tracker-driven loop).**
 
-**Step 5 — Practice the demo.**
+**Step 5 — Practice the demo.** (Still applies, against whatever firmware is actually used for the demo.)
 
 ---
 
@@ -118,3 +118,33 @@ Small ROM, cautious `THERAPIST_MAX_ROM_DEG`, spotter present. Confirm: freeze pa
 - **Real gait cycle durations:** ~2.84s at 0.5 mph down to ~1.34s at 2.0 mph.
 - **Dataset:** S01–S04, 7 speeds × 3 trials = 84 files, ~60s each, ~94.7–100.02 Hz actual sampling.
 - **Reported accuracy:** 99.47% (int8) / 99.64% (float), random split, pseudo-labels (no manual `gait_phase_id` ever recorded).
+
+---
+
+## 7. Revised Plan (current) — Steps A / B / C
+
+Triggered by Step 2 bench testing: the heel-strike tracker surfaced three real bugs in a row (median contamination from sparse/irregular test presses, a jump-validation-vs-reset mismatch causing false freezes) right at the point of driving the motor. Given the live-demo deadline, the tracker was deliberately pulled out of the motor's control path — same shadow-mode principle already used for the CNN (Decision #2), just applied one layer earlier.
+
+**Step A — Open-loop control firmware (no tracker, no FSR dependency).**
+Reverted to the original tested simulated-curve control logic (FSM status, spline, look-ahead, smoothing, jump-validation, collapse-detection safety — all unchanged from the proven version). Two deliberate tweaks: buzzer → built-in RGB LED (solid blue on freeze), and the simulated cycle retuned from a 12.5s bench-test pace to a realistic walking pace. Settled at **2.2s/cycle, `COMMAND_SMOOTH_ALPHA = 0.12`** after live testing showed a brief snap specifically in the 0–30% gait range (the only direction-reversal in the early-stance "knee flexion wave") — most likely gearbox backlash, not a timing/math bug, since a bigger but single-direction sweep later in the cycle stayed smooth even though faster. This is what gets worn for the demo. **Open-loop**, by deliberate choice: the wearer moves along with the device's fixed rhythm rather than the device sensing/adapting to them — true and defensible to say outright if asked, not something to gloss over.
+
+**Step B — Sensor + feature extraction + DL inference pipeline (logging only).**
+Real I2C/FSR reads (verbatim from `knevo_final_status.ino`'s tested MPU6050 code) → the real, full 57-feature recipe from Decision #1 (causal FSR calibration, backward-difference derivatives matching training's non-dt-scaled `np.gradient`, the debounced heel-strike tracker for the 4 boosted-phase features) → TFLite Micro inference (reusing the confirmed-working 130KB internal-SRAM arena setup from `Gait_DL.ino`). Output (predicted phase, probability, tracker's own progress/phase) goes to Serial only — **zero connection to the motor.**
+
+**Step C — Dual-core integration.**
+Step A pinned to one core (strict 10ms, never blocked), Step B pinned to the other (runs at its own pace — its ~47ms inference and heavier per-tick feature math can never stall Step A's timing). The two are not data-connected yet: Step B logs independently; Step A still runs on its own simulated input. A Serial mutex guards console output since both cores print independently. *(Status: in progress.)*
+
+**What did NOT get rebuilt tonight, and why that's fine:** the heel-strike tracker actually driving `Gait_percent` for the motor (the original Step 1→2 goal) is shelved, not abandoned — it's real, working logic (after the bug fixes) but unproven on a worn device under time pressure. Revisit post-deadline with more runway to bench-test the tracker→motor connection properly before trusting it on a person.
+
+---
+
+## 8. Confirmed Future Architecture — Mobile App Integration
+
+Not built tonight; a confirmed design decision for the next phase, logged so it isn't lost:
+
+- **BLE** for short, intermittent config/control: the app sends **max ROM** and **speed/gait time** before a session starts, and sends **start**/**stop** commands. Session ends on timer completion or a stop press.
+- **WiFi** for the bulk data dump: only turned on **after** a session ends, to upload that session's data to the backend. WiFi is never active during motion — consistent with the principle already established tonight (network stalls introduce latency the control loop can't afford during real motion).
+- **Backend** runs anomaly/statistics analysis on uploaded sessions — appropriately, since this is heavy analysis that has no business running on the ESP32 alongside the control loop + model. This is **after-the-fact** review (e.g. for a clinician), not real-time safety — same principle as the CNN: backend/AI can flag concerns after the fact, only on-device hardware-truth can freeze the motor in the moment. Don't let "the backend will catch it" erode that boundary later.
+- **Technical note for later:** BLE and WiFi share the ESP32's radio hardware. This design's natural separation in time (BLE only pre-session, WiFi only post-session) avoids the throughput/latency cost of running both simultaneously — worth deliberately preserving if the architecture evolves.
+- **Direct line to existing firmware:** the two BLE-configured parameters (**max ROM**, **speed/gait time**) are exactly `THERAPIST_MAX_ROM_DEG` and the cycle-pacing constant already being hand-tuned in Step A tonight. Making those runtime-configurable instead of hardcoded is a small, contained future task, not a redesign.
+- **Separately, already resolved tonight:** the 4 original data-collection commands (`CAL_STATIC`/`CAL_UNLOADED`/`CAL_STANDING`/`CAL_KNEE`) in `knevo_final_status.ino` are unrelated to this — they were never used in training this model (confirmed: not present in `raw.zip`, and `robust_norm()` reads percentiles straight from each walking file, not from a separate calibration file). They stay exactly as-is in `knevo_final_status.ino` for future data collection; no need to merge them into the live-inference firmware.
