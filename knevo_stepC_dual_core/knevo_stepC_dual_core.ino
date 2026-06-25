@@ -182,7 +182,15 @@ uint8_t cmdOn[5] = {0x3E, 0x88, 0x01, 0x00, 0xC7};
 
 const int TRAJ_SIZE = 11;
 const float gaitTable[TRAJ_SIZE] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
-const float kneeTable[TRAJ_SIZE] = {3.97, 19.84, 18.86, 11.09, 7.72, 13.86, 38.74, 64.12, 53.27, 17.27, 2.21};
+// DELIBERATE TRADE-OFF (confirmed tonight): original clinical curve had two
+// humps - a small early-stance flexion wave (~10-20% gait) plus the big
+// swing-phase peak (~70% gait) - matching standard gait biomechanics
+// literature, not a data error. Each hump's reversal is a backlash-prone
+// spot on this actuator. Smoothed to ONE peak (same start/end/peak values,
+// monotonic rise into it instead of bump-dip-rise) to drop to a single
+// direction reversal per cycle, trading clinical realism for hardware
+// smoothness - flag this explicitly if asked about it tomorrow.
+const float kneeTable[TRAJ_SIZE] = {4, 8, 14, 20, 28, 38, 50, 64.12, 53, 17, 2};
 
 float Gait_percent = 0.0f;
 float rawMLGaitPercent = 0.0f;
