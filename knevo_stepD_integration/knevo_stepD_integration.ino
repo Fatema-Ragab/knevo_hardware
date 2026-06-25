@@ -199,11 +199,14 @@ const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
 // 5s ramp. 0 is treated as a 13th step, below preset 1, for a full stop.
 const unsigned long SPEED_STEP_MS = 1000;  // one preset step per second
 int currentSpeedIndex = 0;       // 0 = stop, 1-12 = SPEED_PRESETS index; starts stopped (Core 1 only)
-volatile int targetSpeedIndexUser = 1;    // boots aiming at preset 1 (Step D: now written from BLE too)
+// Step D: boot AT REST (target 0, resting at extension) so DeviceState IDLE truly
+// means "motor at rest". The motor stays still until a speed command (1-12) or a
+// START (G / BLE) is given. (stepC booted aiming at preset 1 and walked on its own.)
+volatile int targetSpeedIndexUser = 0;    // boots stopped (also written from BLE)
 unsigned long lastSpeedStepTime = 0;
 float simGaitSpeedPercentPerSec = 0.0f;  // current actual speed, derived from currentSpeedIndex
 volatile bool pendingStopAtExtension = false;  // true while decelerating toward a full stop (cross-core)
-volatile bool fullyStoppedAtExtension = false; // true once actually resting at full extension (cross-core)
+volatile bool fullyStoppedAtExtension = true;  // boot resting at extension; cleared by any speed/START cmd
 
 float speedForIndex(int idx) {
   if (idx <= 0) return 0.0f;
@@ -1567,7 +1570,7 @@ void setup() {
 
   Serial.println("=== KNEVO STEP C: DUAL-CORE INTEGRATION ===");
   Serial.println("Core 1 = Step A (open-loop control, worn). Core 0 = Step B (sensor+DL, logging only).");
-  Serial.print("Target preset on boot: 1 ("); Serial.print(SPEED_PRESETS[0].label); Serial.println(") - stepping up 1 preset/sec from a stop");
+  Serial.println("Boot state: IDLE, motor at rest at extension. Type a speed (1-12) or G<sec> to start.");
   printSpeedMenu();
 
   if (motorOn()) { Serial.println("Motor ON confirmed"); }
