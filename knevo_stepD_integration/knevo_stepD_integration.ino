@@ -91,6 +91,12 @@ void cmdStart(const uint8_t setId[16], uint16_t durationS);
 void cmdStop();
 void cmdCalibrateUnloaded();
 void cmdCalibrateStatic();
+// Globals referenced by checkSpeedCommand()'s "B" diagnostic branch but
+// declared later in the file (next to the buffer/BLE/WiFi code they belong
+// with) - forward-declared here for the same reason as the functions above.
+extern volatile uint32_t bufferCount;
+extern volatile int sessionSpeedIndex;
+extern uint16_t appPort;
 
 // ============================================================
 // SHARED: built-in RGB LED (was duplicated in A and B - one copy)
@@ -1458,7 +1464,7 @@ uint16_t pendingDurationS = 0;
 
 // ---- NimBLE characteristic callbacks (tiny, non-blocking: parse + set flags only) ----
 class WiFiConfigCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     const uint8_t* d = (const uint8_t*)v.data();
     if (v.size() < 7) return;                       // u16 port + 4B ip + u8 ssid_len + u8 pass_len minimum
@@ -1483,7 +1489,7 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
 };
 
 class SetConfigCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     if (v.size() < 30) return;                      // 16B id + u16 dur + 3x f32
     const uint8_t* d = (const uint8_t*)v.data();
@@ -1508,7 +1514,7 @@ class SetConfigCB : public NimBLECharacteristicCallbacks {
 };
 
 class ControlCB : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     if (v.size() < 1) return;
     switch ((uint8_t)v[0]) {
@@ -1545,7 +1551,6 @@ void bleSetup() {
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(KNEVO_SVC_UUID);     // the app scans/filters by this service UUID
-  adv->setScanResponse(true);
   NimBLEDevice::startAdvertising();
 }
 
