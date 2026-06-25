@@ -155,23 +155,38 @@ void printSpeedMenu() {
   Serial.println("============================================================================");
 }
 
-void checkSpeedCommand() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return;
+String speedInputBuffer = "";
 
-  int idx = line.toInt();
-  xSemaphoreTake(serialMutex, portMAX_DELAY);
-  if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
-    currentSpeedPresetIndex = idx;
-    simGaitSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
-    Serial.print(">>> Preset "); Serial.print(idx); Serial.print(": ");
-    Serial.println(SPEED_PRESETS[idx - 1].label);
-  } else {
-    Serial.println(">>> Invalid. Type a number 1-12 and press Enter.");
+void checkSpeedCommand() {
+  // Non-blocking by construction: only consumes bytes already sitting in
+  // the input buffer, never waits for more. Serial.readStringUntil() (the
+  // previous version) blocks for up to ~1s if a full line hasn't arrived
+  // yet - while blocked, Core 1's control loop can't advance, so the next
+  // getGaitPercentInput() call sees a huge dt and produces an oversized
+  // jump, which gets rejected MAX_BAD_READINGS times in a row and freezes
+  // the system. The jump size scales with speed, which is why this only
+  // crossed the threshold at higher presets, not low ones.
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (speedInputBuffer.length() > 0) {
+        int idx = speedInputBuffer.toInt();
+        xSemaphoreTake(serialMutex, portMAX_DELAY);
+        if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
+          currentSpeedPresetIndex = idx;
+          simGaitSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
+          Serial.print(">>> Preset "); Serial.print(idx); Serial.print(": ");
+          Serial.println(SPEED_PRESETS[idx - 1].label);
+        } else {
+          Serial.println(">>> Invalid. Type a number 1-12 and press Enter.");
+        }
+        xSemaphoreGive(serialMutex);
+        speedInputBuffer = "";
+      }
+    } else {
+      speedInputBuffer += c;
+    }
   }
-  xSemaphoreGive(serialMutex);
 }
 
 const float MAX_GAIT_JUMP_PERCENT = 10.0f;
