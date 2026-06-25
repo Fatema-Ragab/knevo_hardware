@@ -144,30 +144,38 @@ const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
   {71.7f,  "1.39s cycle - 1.75 mph"                                    },
   {74.5f,  "1.34s cycle - 2.00 mph (fastest real dataset speed)"       },
 };
-// Ramp: speed changes (including the very first start) now ease in/out
-// instead of jumping instantly. MAX_SPEED_ACCEL_PER_SEC is sized so the
-// FULL range (0 -> fastest preset, 74.5) takes ~5s; smaller changes
-// between two non-zero presets ramp proportionally faster.
-const float MAX_SPEED_ACCEL_PER_SEC = 74.5f / 5.0f;  // ~14.9 (%/s) per second
-float targetSpeedPercentPerSec = SPEED_PRESETS[0].percentPerSec;  // aim at slowest preset on boot
-float simGaitSpeedPercentPerSec = 0.0f;  // CURRENT speed - starts at 0, ramps up to target
-int currentSpeedPresetIndex = 1;
+// Stepping: speed changes now walk through the existing 12 dataset-
+// correlated preset speeds one at a time, advancing exactly one preset
+// per second toward the target - no continuous interpolation, no fixed
+// 5s ramp. 0 is treated as a 13th step, below preset 1, for a full stop.
+const unsigned long SPEED_STEP_MS = 1000;  // one preset step per second
+int currentSpeedIndex = 0;       // 0 = stop, 1-12 = SPEED_PRESETS index; starts stopped
+int targetSpeedIndexUser = 1;    // boots aiming at preset 1
+unsigned long lastSpeedStepTime = 0;
+float simGaitSpeedPercentPerSec = 0.0f;  // current actual speed, derived from currentSpeedIndex
 
-void updateSpeedRamp(float dt) {
-  float maxStep = MAX_SPEED_ACCEL_PER_SEC * dt;
-  float diff = targetSpeedPercentPerSec - simGaitSpeedPercentPerSec;
-  if (diff > maxStep) diff = maxStep;
-  else if (diff < -maxStep) diff = -maxStep;
-  simGaitSpeedPercentPerSec += diff;
+float speedForIndex(int idx) {
+  if (idx <= 0) return 0.0f;
+  if (idx > NUM_SPEED_PRESETS) idx = NUM_SPEED_PRESETS;
+  return SPEED_PRESETS[idx - 1].percentPerSec;
+}
+
+void updateSpeedStepping() {
+  unsigned long now = millis();
+  if (now - lastSpeedStepTime < SPEED_STEP_MS) return;
+  lastSpeedStepTime = now;
+  if (currentSpeedIndex < targetSpeedIndexUser) currentSpeedIndex++;
+  else if (currentSpeedIndex > targetSpeedIndexUser) currentSpeedIndex--;
+  simGaitSpeedPercentPerSec = speedForIndex(currentSpeedIndex);
 }
 
 void printSpeedMenu() {
   Serial.println("=== SPEED PRESETS (type the number + Enter in Serial Monitor to switch) ===");
-  Serial.println("0: STOP (ramps down to zero, ~5s for the full range)");
+  Serial.println("0: STOP (steps down one preset per second to a full stop)");
   for (int i = 0; i < NUM_SPEED_PRESETS; i++) {
     Serial.print(i + 1); Serial.print(": "); Serial.println(SPEED_PRESETS[i].label);
   }
-  Serial.println("Speed changes ease in/out over ~5s (full range) - not instant.");
+  Serial.println("Speed changes step through the presets one at a time, 1 per second.");
   Serial.println("============================================================================");
 }
 
@@ -189,14 +197,13 @@ void checkSpeedCommand() {
         int idx = speedInputBuffer.toInt();
         xSemaphoreTake(serialMutex, portMAX_DELAY);
         if (idx == 0) {
-          targetSpeedPercentPerSec = 0.0f;
-          Serial.println(">>> Target: STOP (0) - ramping down <<<");
+          targetSpeedIndexUser = 0;
+          Serial.println(">>> Target: STOP (0) - stepping down 1 preset/sec <<<");
         } else if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
-          currentSpeedPresetIndex = idx;
-          targetSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
+          targetSpeedIndexUser = idx;
           Serial.print(">>> Target preset "); Serial.print(idx); Serial.print(": ");
           Serial.print(SPEED_PRESETS[idx - 1].label);
-          Serial.println(" - ramping <<<");
+          Serial.println(" - stepping 1 preset/sec <<<");
         } else {
           Serial.println(">>> Invalid. Type 0 (stop) or 1-12 and press Enter.");
         }
@@ -382,7 +389,6 @@ float getGaitPercentInput() {
   float dt = (now - lastGaitUpdateTime) / 1000.0f;
   lastDt = dt;
   lastGaitUpdateTime = now;
-  updateSpeedRamp(dt);
   float step = simGaitSpeedPercentPerSec * dt;
   Gait_percent = wrapGaitPercent(Gait_percent + step);
   return Gait_percent;
@@ -1007,7 +1013,7 @@ void setup() {
 
   Serial.println("=== KNEVO STEP C: DUAL-CORE INTEGRATION ===");
   Serial.println("Core 1 = Step A (open-loop control, worn). Core 0 = Step B (sensor+DL, logging only).");
-  Serial.print("Target gait cycle length: "); Serial.print(100.0f / targetSpeedPercentPerSec, 2); Serial.println(" s (ramping up from a stop)");
+  Serial.print("Target preset on boot: 1 ("); Serial.print(SPEED_PRESETS[0].label); Serial.println(") - stepping up 1 preset/sec from a stop");
   printSpeedMenu();
 
   if (motorOn()) { Serial.println("Motor ON confirmed"); }
@@ -1034,12 +1040,13 @@ void setup() {
 
 // Runs on Core 1 (default Arduino loop core). This is Step A, unchanged.
 unsigned long lastSpeedPrintTime = 0;
-const unsigned long SPEED_PRINT_MS = 250;  // 4x/sec - enough resolution to watch a ~5s ramp clearly
+const unsigned long SPEED_PRINT_MS = 250;  // 4x/sec - enough resolution to watch the 1-per-second steps clearly
 
 void printSpeedStatus() {
   xSemaphoreTake(serialMutex, portMAX_DELAY);
-  Serial.print("[SPEED] current="); Serial.print(simGaitSpeedPercentPerSec, 1);
-  Serial.print(" target="); Serial.print(targetSpeedPercentPerSec, 1);
+  Serial.print("[SPEED] currentIdx="); Serial.print(currentSpeedIndex);
+  Serial.print(" targetIdx="); Serial.print(targetSpeedIndexUser);
+  Serial.print(" speed="); Serial.print(simGaitSpeedPercentPerSec, 1);
   Serial.print(" cycle=");
   if (simGaitSpeedPercentPerSec > 0.01f) { Serial.print(100.0f / simGaitSpeedPercentPerSec, 2); Serial.println("s"); }
   else { Serial.println("stopped"); }
@@ -1050,6 +1057,7 @@ void loop() {
   unsigned long now = millis();
 
   checkSpeedCommand();
+  updateSpeedStepping();
 
   if (now - lastSpeedPrintTime >= SPEED_PRINT_MS) {
     lastSpeedPrintTime = now;
