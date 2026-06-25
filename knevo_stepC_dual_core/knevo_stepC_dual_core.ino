@@ -326,7 +326,12 @@ void checkScenario2Emergency() {
   }
 }
 
+// Set to false to silence Core A's plotter line and focus on Core B's
+// [STATUS-B] output instead. Set back to true to watch the motor curve.
+const bool SHOW_CORE_A_PLOTTER = false;
+
 void printPlotterLine() {
+  if (!SHOW_CORE_A_PLOTTER) return;
   xSemaphoreTake(serialMutex, portMAX_DELAY);
   Serial.print(rawMLGaitPercent, 1);      Serial.print(",");
   Serial.print(usedGaitPercent, 1);       Serial.print(",");
@@ -786,6 +791,8 @@ void setupStepB() {
   rateWindowStart = millis();
 }
 
+uint32_t last_i2c_us = 0, last_feature_us = 0;
+
 void coreBTask(void* pvParameters) {
   for (;;) {
     uint32_t now_us = micros();
@@ -793,6 +800,7 @@ void coreBTask(void* pvParameters) {
     if ((int32_t)(now_us - next_sample_time_us) >= 0) {
       next_sample_time_us += SAMPLE_PERIOD_US;
 
+      uint32_t t_i2c_start = micros();
       int16_t ax_raw[3], ay_raw[3], az_raw[3], gx_raw[3], gy_raw[3], gz_raw[3];
       for (int i = 0; i < 3; i++) {
         if (imus[i].ok) {
@@ -801,6 +809,7 @@ void coreBTask(void* pvParameters) {
           ax_raw[i]=0; ay_raw[i]=0; az_raw[i]=0; gx_raw[i]=0; gy_raw[i]=0; gz_raw[i]=0;
         }
       }
+      last_i2c_us = micros() - t_i2c_start;
 
       float ax_g[3], ay_g[3], az_g[3], gx_rs[3], gy_rs[3], gz_rs[3];
       for (int i = 0; i < 3; i++) {
@@ -817,8 +826,10 @@ void coreBTask(void* pvParameters) {
       float heelNorm = normalize01(heelRaw, heelLow, heelHigh);
       float midNorm  = normalize01(midRaw, midLow, midHigh);
 
+      uint32_t t_feat_start = micros();
       updateHeelStrikeTracker(heelNorm, midNorm);
       computeFeatures(ax_g, ay_g, az_g, gx_rs, gy_rs, gz_rs, heelNorm, midNorm);
+      last_feature_us = micros() - t_feat_start;
 
       pushQuantizedSampleToWindow(sampleFeatures);
       if (window_ready) {
@@ -848,7 +859,9 @@ void coreBTask(void* pvParameters) {
       Serial.print(last_predicted_phase >= 0 ? CNN_PHASE_NAMES[last_predicted_phase] : "none-yet");
       Serial.print(" Prob="); Serial.print(last_probability, 3);
       Serial.print(" Prep="); Serial.print(last_prep_us); Serial.print("us");
-      Serial.print(" Invoke="); Serial.print(last_invoke_us); Serial.println("us");
+      Serial.print(" Invoke="); Serial.print(last_invoke_us); Serial.print("us");
+      Serial.print(" | I2C="); Serial.print(last_i2c_us); Serial.print("us");
+      Serial.print(" Feature="); Serial.print(last_feature_us); Serial.println("us");
       xSemaphoreGive(serialMutex);
     }
 
