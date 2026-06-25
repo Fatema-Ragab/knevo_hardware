@@ -153,6 +153,8 @@ int currentSpeedIndex = 0;       // 0 = stop, 1-12 = SPEED_PRESETS index; starts
 int targetSpeedIndexUser = 1;    // boots aiming at preset 1
 unsigned long lastSpeedStepTime = 0;
 float simGaitSpeedPercentPerSec = 0.0f;  // current actual speed, derived from currentSpeedIndex
+bool pendingStopAtExtension = false;  // true while decelerating toward a full stop
+bool fullyStoppedAtExtension = false; // true once actually resting at full extension
 
 float speedForIndex(int idx) {
   if (idx <= 0) return 0.0f;
@@ -197,9 +199,16 @@ void checkSpeedCommand() {
         int idx = speedInputBuffer.toInt();
         xSemaphoreTake(serialMutex, portMAX_DELAY);
         if (idx == 0) {
-          targetSpeedIndexUser = 0;
-          Serial.println(">>> Target: STOP (0) - stepping down 1 preset/sec <<<");
+          if (currentSpeedIndex == 0 && !pendingStopAtExtension) {
+            Serial.println(">>> Already stopped at full extension. <<<");
+          } else {
+            targetSpeedIndexUser = 1;        // step down to the slowest preset, not straight to 0
+            pendingStopAtExtension = true;   // then keep moving at that speed until extension is reached
+            Serial.println(">>> Target: STOP - finishing current stride, will rest at full extension <<<");
+          }
         } else if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
+          pendingStopAtExtension = false;
+          fullyStoppedAtExtension = false;
           targetSpeedIndexUser = idx;
           Serial.print(">>> Target preset "); Serial.print(idx); Serial.print(": ");
           Serial.print(SPEED_PRESETS[idx - 1].label);
@@ -390,7 +399,23 @@ float getGaitPercentInput() {
   lastDt = dt;
   lastGaitUpdateTime = now;
   float step = simGaitSpeedPercentPerSec * dt;
+  float prevGaitPercent = Gait_percent;
   Gait_percent = wrapGaitPercent(Gait_percent + step);
+
+  // Stride just completed (percent wrapped from ~100 back to ~0) while
+  // already down to the slowest preset and a stop was requested - this
+  // is the extension point (gait%=0, the curve's minimum). Finalize the
+  // stop here instead of continuing, so it always rests at full
+  // extension rather than wherever in the cycle it happened to be.
+  if (pendingStopAtExtension && currentSpeedIndex == 1 && Gait_percent < prevGaitPercent) {
+    pendingStopAtExtension = false;
+    fullyStoppedAtExtension = true;
+    currentSpeedIndex = 0;
+    targetSpeedIndexUser = 0;
+    simGaitSpeedPercentPerSec = 0.0f;
+    Gait_percent = 0.0f;
+  }
+
   return Gait_percent;
 }
 
@@ -430,9 +455,19 @@ float validateOrPredictGait(float newGaitPercent) {
 void updateSmoothFSMAndTrajectory(float gp) {
   statusCode = getFSMStatusCode(gp);
   supportMode = isStanceSupportState(statusCode) ? 1 : 0;
-  lookAheadGaitPercent = wrapGaitPercent(gp + LOOKAHEAD_PERCENT);
-  desiredAngleNormal = smoothClinicalAngle(lookAheadGaitPercent);
-  desiredAngleROM = scaleAngleToPatientROM(desiredAngleNormal);
+
+  if (fullyStoppedAtExtension) {
+    // Bypass the look-ahead entirely - it would otherwise keep aiming
+    // ~4% into the curve ahead of true extension (landing ~8-14 deg
+    // instead of the actual floor). Target the floor directly.
+    desiredAngleNormal = kneeTable[0];
+    desiredAngleROM = NORMAL_ROM_MIN_DEG;
+  } else {
+    lookAheadGaitPercent = wrapGaitPercent(gp + LOOKAHEAD_PERCENT);
+    desiredAngleNormal = smoothClinicalAngle(lookAheadGaitPercent);
+    desiredAngleROM = scaleAngleToPatientROM(desiredAngleNormal);
+  }
+
   if (!commandFilterReady) { commandedAngle = desiredAngleROM; commandFilterReady = true; }
   else { commandedAngle = commandedAngle + COMMAND_SMOOTH_ALPHA * (desiredAngleROM - commandedAngle); }
   commandedAngle = clampFloat(commandedAngle, NORMAL_ROM_MIN_DEG, THERAPIST_MAX_ROM_DEG);
@@ -1047,6 +1082,9 @@ void printSpeedStatus() {
   Serial.print("[SPEED] currentIdx="); Serial.print(currentSpeedIndex);
   Serial.print(" targetIdx="); Serial.print(targetSpeedIndexUser);
   Serial.print(" speed="); Serial.print(simGaitSpeedPercentPerSec, 1);
+  Serial.print(" pendingStop="); Serial.print(pendingStopAtExtension ? 1 : 0);
+  Serial.print(" stoppedAtExt="); Serial.print(fullyStoppedAtExtension ? 1 : 0);
+  Serial.print(" commandedAngle="); Serial.print(commandedAngle, 1);
   Serial.print(" cycle=");
   if (simGaitSpeedPercentPerSec > 0.01f) { Serial.print(100.0f / simGaitSpeedPercentPerSec, 2); Serial.println("s"); }
   else { Serial.println("stopped"); }
