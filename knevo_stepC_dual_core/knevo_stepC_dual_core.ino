@@ -124,7 +124,55 @@ const unsigned long FEEDBACK_MS = 250;
 
 const float LOOKAHEAD_PERCENT = 4.0f;
 const float COMMAND_SMOOTH_ALPHA = 0.12f;
-const float SIM_GAIT_SPEED_PERCENT_PER_SEC = 45.5f;  // ~2.2s/cycle
+// Combined bridge + dataset speed table, ordered slowest -> fastest by
+// actual cycle length (not by mph label - 1.25mph and 1.50mph swap order
+// here because of noise in the cycle-length estimate, flagged earlier).
+// Runtime-adjustable: type the preset number + Enter in Serial Monitor.
+struct SpeedPreset { float percentPerSec; const char* label; };
+const int NUM_SPEED_PRESETS = 12;
+const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
+  { 8.0f,  "12.5s cycle - ORIGINAL (too slow, not based on real gait)" },
+  {10.0f,  "10.0s cycle"                                               },
+  {12.5f,  "8.0s cycle"                                                },
+  {16.7f,  "6.0s cycle"                                                },
+  {25.0f,  "4.0s cycle"                                                },
+  {35.2f,  "2.84s cycle - 0.50 mph (slowest real dataset speed)"       },
+  {48.1f,  "2.08s cycle - 0.75 mph"                                    },
+  {58.0f,  "1.73s cycle - 1.00 mph"                                    },
+  {67.3f,  "1.49s cycle - 1.50 mph"                                    },
+  {70.1f,  "1.43s cycle - 1.25 mph"                                    },
+  {71.7f,  "1.39s cycle - 1.75 mph"                                    },
+  {74.5f,  "1.34s cycle - 2.00 mph (fastest real dataset speed)"       },
+};
+float simGaitSpeedPercentPerSec = SPEED_PRESETS[0].percentPerSec;  // start at slowest, per request
+int currentSpeedPresetIndex = 1;
+
+void printSpeedMenu() {
+  Serial.println("=== SPEED PRESETS (type the number + Enter in Serial Monitor to switch) ===");
+  for (int i = 0; i < NUM_SPEED_PRESETS; i++) {
+    Serial.print(i + 1); Serial.print(": "); Serial.println(SPEED_PRESETS[i].label);
+  }
+  Serial.println("============================================================================");
+}
+
+void checkSpeedCommand() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+
+  int idx = line.toInt();
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  if (idx >= 1 && idx <= NUM_SPEED_PRESETS) {
+    currentSpeedPresetIndex = idx;
+    simGaitSpeedPercentPerSec = SPEED_PRESETS[idx - 1].percentPerSec;
+    Serial.print(">>> Preset "); Serial.print(idx); Serial.print(": ");
+    Serial.println(SPEED_PRESETS[idx - 1].label);
+  } else {
+    Serial.println(">>> Invalid. Type a number 1-12 and press Enter.");
+  }
+  xSemaphoreGive(serialMutex);
+}
 
 const float MAX_GAIT_JUMP_PERCENT = 10.0f;
 const int   MAX_BAD_READINGS      = 3;
@@ -277,7 +325,7 @@ float getGaitPercentInput() {
   if (lastGaitUpdateTime == 0) { lastGaitUpdateTime = now; return Gait_percent; }
   float dt = (now - lastGaitUpdateTime) / 1000.0f;
   lastGaitUpdateTime = now;
-  float step = SIM_GAIT_SPEED_PERCENT_PER_SEC * dt;
+  float step = simGaitSpeedPercentPerSec * dt;
   Gait_percent = wrapGaitPercent(Gait_percent + step);
   return Gait_percent;
 }
@@ -883,7 +931,8 @@ void setup() {
 
   Serial.println("=== KNEVO STEP C: DUAL-CORE INTEGRATION ===");
   Serial.println("Core 1 = Step A (open-loop control, worn). Core 0 = Step B (sensor+DL, logging only).");
-  Serial.print("Simulated gait cycle length: "); Serial.print(100.0f / SIM_GAIT_SPEED_PERCENT_PER_SEC, 2); Serial.println(" s");
+  Serial.print("Simulated gait cycle length: "); Serial.print(100.0f / simGaitSpeedPercentPerSec, 2); Serial.println(" s");
+  printSpeedMenu();
 
   if (motorOn()) { Serial.println("Motor ON confirmed"); }
   else { Serial.println("Motor ON failed"); }
@@ -910,6 +959,8 @@ void setup() {
 // Runs on Core 1 (default Arduino loop core). This is Step A, unchanged.
 void loop() {
   unsigned long now = millis();
+
+  checkSpeedCommand();
 
   if (now - lastControlTime >= CONTROL_MS) {
     lastControlTime = now;
