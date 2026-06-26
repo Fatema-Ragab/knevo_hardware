@@ -1506,6 +1506,24 @@ void bleRadioUpAfterUpload() {
   netLogf("BLE back on-air (advertising) after upload");
 }
 
+// One-time WiFi event hook. The coarse WiFi.status() can't say WHY a join fails;
+// the ESP-IDF disconnect reason can. Key codes: 15 = 4WAY_HANDSHAKE_TIMEOUT and
+// 2/204 = AUTH_* -> wrong password; 201 = NO_AP_FOUND -> SSID not in range or a
+// 5GHz-only network (ESP32 is 2.4GHz-only); 3 = ASSOC_LEAVE; 205 = CONNECTION_FAIL.
+// STA_CONNECTED firing means the password/AP are fine and only IP/DHCP is pending.
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_START:     netLogf("WiFi event: STA_START"); break;
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED: netLogf("WiFi event: STA_CONNECTED (assoc OK, awaiting IP)"); break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:    netLogf("WiFi event: GOT_IP"); break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      netLogf("WiFi event: STA_DISCONNECTED reason=%d (15/2/204=wrong pwd; 201=no_ap_found/5GHz; 3=assoc_leave; 205=conn_fail)",
+              (int)info.wifi_sta_disconnected.reason);
+      break;
+    default: break;
+  }
+}
+
 void serviceNet() {
   if (netState == NET_IDLE) {
     // NOTE: provisioning no longer brings WiFi up (that would drop the BLE link on
@@ -1798,6 +1816,7 @@ void setup() {
   Serial.println("BLE advertising as '" KNEVO_BLE_NAME "'.");
 
   serialMutex = xSemaphoreCreateMutex();
+  WiFi.onEvent(onWiFiEvent);   // log precise STA disconnect reason during upload joins
   xTaskCreatePinnedToCore(coreBTask, "CoreB_SensorDL", 16384, NULL, 1, NULL, 0);
 
   // Step A's tail: ease to extension at preset-1's pace (not an instant snap).
