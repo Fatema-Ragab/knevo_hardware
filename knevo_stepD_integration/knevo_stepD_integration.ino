@@ -45,6 +45,7 @@
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>   // esp_timer_get_time() for monotonic per-sample timestamps
+#include <cstdarg>       // va_list/vsnprintf for netLogf()
 
 // Step D — mobile-contract integration.
 // NimBLE-Arduino 2.x (install via Library Manager). 2.x callback signatures
@@ -1383,6 +1384,19 @@ volatile bool uploadRequested   = false;   // post-set batch upload
 NimBLECharacteristic* chWifiStatus = nullptr;
 NimBLECharacteristic* chDevStatus  = nullptr;
 
+// Mutex-guarded logger for the BLE/WiFi data plane. Every connect / drop /
+// provisioning / notify event prints "[net] ..." on the Serial monitor so the
+// provisioning flow can be traced from the bench. Safe from BLE-callback and
+// Core-0 contexts (it takes serialMutex itself — never call it while already
+// holding serialMutex).
+void netLogf(const char* fmt, ...) {
+  char buf[160];
+  va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.print("[net] "); Serial.println(buf);
+  xSemaphoreGive(serialMutex);
+}
+
 void deviceStatusNotify() {
   if (!chDevStatus) return;
   uint8_t b[3] = { (uint8_t)deviceState, BATTERY_PCT_UNKNOWN, lastFaultCode };  // §3.5: state, battery, fault
@@ -1390,7 +1404,8 @@ void deviceStatusNotify() {
   chDevStatus->notify();
 }
 void wifiStatusNotify(uint8_t status, uint8_t err) {   // §3.3: 0=OK, else err code
-  if (!chWifiStatus) return;
+  netLogf("WiFiStatus notify -> status=%u err=%u", status, err);
+  if (!chWifiStatus) { netLogf("WiFiStatus: characteristic not ready, notify dropped"); return; }
   uint8_t b[2] = { status, err };
   chWifiStatus->setValue(b, 2);
   chWifiStatus->notify();
@@ -1458,6 +1473,8 @@ void startWifiConnect(bool forUpload) {
   WiFi.begin(wifiSsid, wifiPass);
   netWifiStartMs = millis();
   netState = NET_WIFI_CONNECTING;
+  netLogf("WiFi.begin('%s') %s, waiting up to %lums", wifiSsid,
+          forUpload ? "[upload]" : "[provisioning test]", WIFI_CONNECT_TIMEOUT_MS);
 }
 
 void serviceNet() {
@@ -1482,10 +1499,14 @@ void serviceNet() {
   }
   // NET_WIFI_CONNECTING
   if (WiFi.status() == WL_CONNECTED) {
+    netLogf("WiFi connected: ip=%s rssi=%ddBm after %lums",
+            WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
+            (unsigned long)(millis() - netWifiStartMs));
     if (netForUpload) {
       bool ok = doUpload();
       if (!ok) ok = doUpload();                                      // one retry over the live WiFi (review Issue 3)
       WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+      netLogf("WiFi disconnected (upload %s)", ok ? "OK" : "FAILED");
       lastFaultCode = ok ? 0 : 0x12;                                 // 0x12 = upload_failed (recoverable; buffer kept)
       deviceState = DEV_IDLE;
       deviceStatusNotify();
@@ -1493,9 +1514,13 @@ void serviceNet() {
       strncpy(lastTestedSsid, wifiSsid, sizeof(lastTestedSsid) - 1);
       wifiStatusNotify(0, 0);                                        // provisioning OK
       WiFi.disconnect(true); WiFi.mode(WIFI_OFF);                    // device disconnects WiFi after the test
+      netLogf("WiFi disconnected (provisioning test OK)");
     }
     netState = NET_IDLE;
   } else if (millis() - netWifiStartMs > WIFI_CONNECT_TIMEOUT_MS) {
+    netLogf("WiFi connect TIMEOUT after %lums (WiFi.status=%d) %s",
+            (unsigned long)(millis() - netWifiStartMs), (int)WiFi.status(),
+            netForUpload ? "[upload]" : "[test]");
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
     if (netForUpload) { lastFaultCode = 0x13; deviceState = DEV_IDLE; deviceStatusNotify(); } // 0x13 = wifi_join_failed
     else wifiStatusNotify(1, 3);                                    // 3 = timeout
@@ -1512,7 +1537,8 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
     std::string v = c->getValue();
     const uint8_t* d = (const uint8_t*)v.data();
-    if (v.size() < 7) return;                       // u16 port + 4B ip + u8 ssid_len + u8 pass_len minimum
+    netLogf("WiFiConfig write: %u bytes", (unsigned)v.size());
+    if (v.size() < 7) { netLogf("WiFiConfig: too short (<7), ignored"); return; } // u16 port + 4B ip + u8 ssid_len + u8 pass_len minimum
     size_t o = 0;
     appPort = rdU16(d + o); o += 2;                 // ALWAYS refresh IP + port
     appIp[0] = d[o]; appIp[1] = d[o + 1]; appIp[2] = d[o + 2]; appIp[3] = d[o + 3]; o += 4;
@@ -1522,17 +1548,24 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
       // before every set): KEEP the provisioned SSID/password and do NOT re-test.
       // Without this, the empty write would wipe the credentials provisioned
       // earlier and the post-set WiFi upload could never connect.
+      netLogf("WiFiConfig: IP/port refresh only -> app=%u.%u.%u.%u:%u (kept SSID '%s')",
+              appIp[0], appIp[1], appIp[2], appIp[3], appPort, wifiSsid);
       return;
     }
-    if (o + ssidLen + 1 > v.size()) return;
+    if (o + ssidLen + 1 > v.size()) { netLogf("WiFiConfig: truncated SSID field, ignored"); return; }
     uint8_t n1 = ssidLen < 32 ? ssidLen : 32; memcpy(wifiSsid, d + o, n1); wifiSsid[n1] = 0; o += ssidLen;
-    uint8_t passLen = d[o++]; if (o + passLen > v.size()) return;
+    uint8_t passLen = d[o++]; if (o + passLen > v.size()) { netLogf("WiFiConfig: truncated pass field, ignored"); return; }
     uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
+    netLogf("WiFiConfig: SSID='%s' (%u-char pass), app=%u.%u.%u.%u:%u",
+            wifiSsid, (unsigned)n2, appIp[0], appIp[1], appIp[2], appIp[3], appPort);
     // Only kick off a provisioning test when IDLE — never bring WiFi up mid-set
     // (review Issue 1). Creds are still stored above; the test just waits for idle.
     if (deviceState == DEV_IDLE) {
       lastTestedSsid[0] = 0;                          // new creds -> force a fresh provisioning test
       wifiTestRequested = true;                       // serviceNet() connects, tests, reports WiFiStatus
+      netLogf("WiFiConfig: provisioning test queued");
+    } else {
+      netLogf("WiFiConfig: state=%d (not IDLE) -> creds stored, test deferred", (int)deviceState);
     }
   }
 };
@@ -1578,9 +1611,27 @@ class ControlCB : public NimBLECharacteristicCallbacks {
   }
 };
 
+// Server-level connect/disconnect logging. Critical for debugging the "BLE drops
+// when WiFi provisioning starts" symptom: the disconnect `reason` code tells us
+// WHY the link dropped (e.g. 0x08/0x213 = supervision timeout, typical of WiFi
+// radio coexistence stealing airtime; 0x16 = local terminated; 0x13 = peer/app
+// terminated normally). Re-advertise on disconnect so the app can reconnect once
+// the radio frees up (NimBLE 2.x may also auto-restart; this is explicit + logged).
+class ServerCB : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    netLogf("BLE connected: peer=%s", connInfo.getAddress().toString().c_str());
+  }
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    netLogf("BLE disconnected: peer=%s reason=0x%02X -> re-advertising",
+            connInfo.getAddress().toString().c_str(), reason);
+    NimBLEDevice::startAdvertising();
+  }
+};
+
 void bleSetup() {
   NimBLEDevice::init(KNEVO_BLE_NAME);
   NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new ServerCB());
   NimBLEService* svc = server->createService(KNEVO_SVC_UUID);
 
   NimBLECharacteristic* chWifiCfg = svc->createCharacteristic(KNEVO_WIFICONFIG_UUID, NIMBLE_PROPERTY::WRITE);
