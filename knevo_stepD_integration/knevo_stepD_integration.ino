@@ -1377,7 +1377,6 @@ char     wifiPass[64] = {0};
 uint8_t  appIp[4]     = {0, 0, 0, 0};
 uint16_t appPort      = 0;            // 0 => not provisioned (Serial-only mode skips upload)
 char     lastTestedSsid[33] = {0};
-volatile bool wifiTestRequested = false;   // provisioning connection test
 volatile bool uploadRequested   = false;   // post-set batch upload
 
 // ---- BLE characteristic handles + notify helpers ----
@@ -1479,13 +1478,11 @@ void startWifiConnect(bool forUpload) {
 
 void serviceNet() {
   if (netState == NET_IDLE) {
-    if (wifiTestRequested) {
-      if (deviceState != DEV_IDLE) return;                           // never run a WiFi test mid-set (Issue 1) — defer
-      wifiTestRequested = false;
-      if (wifiSsid[0] == 0) { wifiStatusNotify(1, 2); return; }       // 2 = ssid_not_found / not set
-      if (strcmp(wifiSsid, lastTestedSsid) == 0) { wifiStatusNotify(0, 0); return; } // already validated
-      startWifiConnect(false);
-    } else if (uploadRequested) {
+    // NOTE: provisioning no longer brings WiFi up (that would drop the BLE link on
+    // this single-radio chip before the WiFiStatus reply could be sent) — creds are
+    // accepted and confirmed over BLE in WiFiConfigCB. WiFi is powered ONLY for the
+    // post-set upload below, when BLE is no longer needed for control.
+    if (uploadRequested) {
       if (wifiSsid[0] == 0) { uploadRequested = false; deviceState = DEV_IDLE; return; }
       // Keep the radio OFF until the motor has physically settled — the graceful
       // stop stride is still motion (review smaller-note). Data was already frozen
@@ -1558,15 +1555,17 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
     uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
     netLogf("WiFiConfig: SSID='%s' (%u-char pass), app=%u.%u.%u.%u:%u",
             wifiSsid, (unsigned)n2, appIp[0], appIp[1], appIp[2], appIp[3], appPort);
-    // Only kick off a provisioning test when IDLE — never bring WiFi up mid-set
-    // (review Issue 1). Creds are still stored above; the test just waits for idle.
-    if (deviceState == DEV_IDLE) {
-      lastTestedSsid[0] = 0;                          // new creds -> force a fresh provisioning test
-      wifiTestRequested = true;                       // serviceNet() connects, tests, reports WiFiStatus
-      netLogf("WiFiConfig: provisioning test queued");
-    } else {
-      netLogf("WiFiConfig: state=%d (not IDLE) -> creds stored, test deferred", (int)deviceState);
-    }
+    // Single shared 2.4GHz radio: bringing WiFi up here (a "live cred test") tears
+    // down THIS BLE link via coexistence before we can answer, so the WiFiStatus
+    // notify the app is waiting for would never arrive -> provisioning hangs/fails.
+    // Instead, accept the creds and confirm provisioning OK over the still-connected
+    // BLE link now. The credentials are validated for real at the post-set upload,
+    // which reports fault 0x13 (wifi_join_failed) over DeviceStatus if the join
+    // fails. This keeps BLE and WiFi strictly time-separated, per the architecture.
+    strncpy(lastTestedSsid, wifiSsid, sizeof(lastTestedSsid) - 1);
+    lastTestedSsid[sizeof(lastTestedSsid) - 1] = 0;
+    wifiStatusNotify(0, 0);                            // provisioning accepted (OK) over live BLE
+    netLogf("WiFiConfig: creds accepted, WiFiStatus OK sent (live join deferred to upload)");
   }
 };
 
