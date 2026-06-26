@@ -1423,6 +1423,7 @@ void requestUpload() {
 // (NetState enum + netState are declared near the top so cmdStart can check them.)
 bool netForUpload = false;
 unsigned long netWifiStartMs = 0;
+unsigned long netLastProgressMs = 0;                  // throttles the per-second connect-progress log
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 // Returns true on a successful send + ACK. Yields between chunks so a multi-second
@@ -1430,10 +1431,11 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 bool doUpload() {
   WiFiClient client;
   IPAddress ip(appIp[0], appIp[1], appIp[2], appIp[3]);
+  netLogf("Upload: TCP connect -> %u.%u.%u.%u:%u (%u samples)",
+          appIp[0], appIp[1], appIp[2], appIp[3], appPort, (unsigned)bufferCount);
   if (!client.connect(ip, appPort, 5000)) {
-    xSemaphoreTake(serialMutex, portMAX_DELAY);
-    Serial.println(">>> Upload: TCP connect to app failed");
-    xSemaphoreGive(serialMutex);
+    netLogf("Upload: TCP connect to %u.%u.%u.%u:%u FAILED",
+            appIp[0], appIp[1], appIp[2], appIp[3], appPort);
     return false;
   }
   uint32_t n = bufferCount;
@@ -1471,9 +1473,10 @@ void startWifiConnect(bool forUpload) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid, wifiPass);
   netWifiStartMs = millis();
+  netLastProgressMs = netWifiStartMs;
   netState = NET_WIFI_CONNECTING;
-  netLogf("WiFi.begin('%s') %s, waiting up to %lums", wifiSsid,
-          forUpload ? "[upload]" : "[provisioning test]", WIFI_CONNECT_TIMEOUT_MS);
+  netLogf("WiFi.begin('%s') [upload], will push to %u.%u.%u.%u:%u, waiting up to %lums",
+          wifiSsid, appIp[0], appIp[1], appIp[2], appIp[3], appPort, WIFI_CONNECT_TIMEOUT_MS);
 }
 
 void serviceNet() {
@@ -1495,6 +1498,11 @@ void serviceNet() {
     return;
   }
   // NET_WIFI_CONNECTING
+  if (millis() - netLastProgressMs >= 1000) {          // ~1Hz progress so a stuck join is visible
+    netLastProgressMs = millis();
+    netLogf("WiFi joining '%s'... status=%d (%lums elapsed)", wifiSsid, (int)WiFi.status(),
+            (unsigned long)(millis() - netWifiStartMs));
+  }
   if (WiFi.status() == WL_CONNECTED) {
     netLogf("WiFi connected: ip=%s rssi=%ddBm after %lums",
             WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
@@ -1515,9 +1523,8 @@ void serviceNet() {
     }
     netState = NET_IDLE;
   } else if (millis() - netWifiStartMs > WIFI_CONNECT_TIMEOUT_MS) {
-    netLogf("WiFi connect TIMEOUT after %lums (WiFi.status=%d) %s",
-            (unsigned long)(millis() - netWifiStartMs), (int)WiFi.status(),
-            netForUpload ? "[upload]" : "[test]");
+    netLogf("WiFi connect TIMEOUT joining '%s' after %lums (WiFi.status=%d; 3=connected,6=disconnected,4=connect_failed,1=no_ssid)",
+            wifiSsid, (unsigned long)(millis() - netWifiStartMs), (int)WiFi.status());
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
     if (netForUpload) { lastFaultCode = 0x13; deviceState = DEV_IDLE; deviceStatusNotify(); } // 0x13 = wifi_join_failed
     else wifiStatusNotify(1, 3);                                    // 3 = timeout
