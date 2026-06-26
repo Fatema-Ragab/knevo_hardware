@@ -198,6 +198,17 @@ const SpeedPreset SPEED_PRESETS[NUM_SPEED_PRESETS] = {
   {71.7f,  "1.39s cycle - 1.75 mph"                                    },
   {74.5f,  "1.34s cycle - 2.00 mph (fastest real dataset speed)"       },
 };
+
+// Sum of |delta knee angle| across the retimed gaitTable/kneeTable segments
+// (4+6+6+8+10+12+14.12+11.12+36+15 = 122.24) - the same total used when the
+// breakpoints were retimed for uniform per-segment speed. Used below to
+// derive a genuinely-safe boot ease-in rate from preset 1's pace, instead of
+// picking a number out of the air.
+const float TOTAL_CYCLE_DEGREES = 122.24f;
+float bootEaseRateDegPerSec() {
+  float presetOneCycleSeconds = 100.0f / SPEED_PRESETS[0].percentPerSec;  // preset 1 = slowest
+  return TOTAL_CYCLE_DEGREES / presetOneCycleSeconds;                     // ~9.78 deg/s
+}
 // Stepping: speed changes now walk through the existing 12 dataset-
 // correlated preset speeds one at a time, advancing exactly one preset
 // per second toward the target - no continuous interpolation, no fixed
@@ -1596,6 +1607,51 @@ void bleSetup() {
    ===================   SETUP / LOOP   ========================
    ============================================================ */
 
+// Boot safety: ease to the extension position at preset-1's pace instead of
+// snapping there at the actuator's own default (fast, unsafe) internal speed.
+// Reads the REAL current angle first (whatever it happens to be from before
+// power-off), then steps toward THERAPIST_MIN_ROM_DEG at a fixed, derived-
+// from-the-curve rate, before the main control loop (and its EMA filter,
+// which eases by PERCENTAGE of remaining distance, not a fixed safe speed)
+// ever starts.
+void easeToExtensionOnBoot() {
+  actualAngle = readActualAngleQuick();
+  float current = actualAngle;
+  float target = THERAPIST_MIN_ROM_DEG;
+  float rate = bootEaseRateDegPerSec();
+
+  float dist = fabsf(target - current);
+  if (dist < 0.5f) {
+    commandedAngle = target;
+    sendPositionFast(commandedAngle);
+    lastSentAngle = commandedAngle;
+    commandFilterReady = true;
+    return;
+  }
+
+  Serial.print("Boot: easing from "); Serial.print(current, 1);
+  Serial.print(" deg to extension ("); Serial.print(target, 1);
+  Serial.print(" deg) at preset-1 pace ("); Serial.print(rate, 1);
+  Serial.println(" deg/s) before normal control starts.");
+
+  const unsigned long STEP_MS = 20;                 // 50Hz during the ease
+  const float stepDeg = rate * (STEP_MS / 1000.0f);
+  float pos = current;
+  float dir = (target > current) ? 1.0f : -1.0f;
+
+  while (fabsf(target - pos) > stepDeg) {
+    pos += dir * stepDeg;
+    sendPositionFast(pos);
+    delay(STEP_MS);
+  }
+  sendPositionFast(target);
+
+  commandedAngle = target;
+  lastSentAngle = target;
+  commandFilterReady = true;          // hand off to the normal EMA filter, already AT the target
+  actualAngle = readActualAngleQuick();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(3000);
@@ -1625,14 +1681,10 @@ void setup() {
   serialMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(coreBTask, "CoreB_SensorDL", 16384, NULL, 1, NULL, 0);
 
-  // Step A's tail: first gait target + initial motor position.
+  // Step A's tail: ease to extension at preset-1's pace (not an instant snap).
   rawMLGaitPercent = 0.0f;
   usedGaitPercent = 0.0f;
-  updateSmoothFSMAndTrajectory(usedGaitPercent);
-  sendPositionFast(commandedAngle);
-  lastSentAngle = commandedAngle;
-  delay(500);
-  actualAngle = readActualAngleQuick();
+  easeToExtensionOnBoot();
 
   Serial.println("RawGait,UsedGait,LookAheadGait,State_x10,DesiredNormal_deg,DesiredROM_deg,Commanded_deg,Actual_deg,BadReading_x20,ErrorCount_x5,SupportMode_x15,Frozen_x70");
   Serial.println("=== BOTH CORES RUNNING ===");
