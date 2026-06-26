@@ -1383,6 +1383,13 @@ volatile bool uploadRequested   = false;   // post-set batch upload
 NimBLECharacteristic* chWifiStatus = nullptr;
 NimBLECharacteristic* chDevStatus  = nullptr;
 
+// BLE link tracking for the WiFi-upload radio handoff. The ESP32 has ONE 2.4GHz
+// radio: an active BLE connection contends with WiFi and makes the upload's join
+// fail (WL_CONNECT_FAILED). So we take BLE off-air for the upload, then restore it.
+volatile uint16_t bleConnHandle    = 0;
+volatile bool     bleClientConnected = false;
+volatile bool     bleUploadHandoff = false;   // true while BLE is intentionally off-air for an upload
+
 // Mutex-guarded logger for the BLE/WiFi data plane. Every connect / drop /
 // provisioning / notify event prints "[net] ..." on the Serial monitor so the
 // provisioning flow can be traced from the bench. Safe from BLE-callback and
@@ -1479,6 +1486,26 @@ void startWifiConnect(bool forUpload) {
           wifiSsid, appIp[0], appIp[1], appIp[2], appIp[3], appPort, WIFI_CONNECT_TIMEOUT_MS);
 }
 
+// Take BLE off-air so WiFi gets the radio for the upload (time-separated radios,
+// per the architecture). The app talks to the upload over TCP, not BLE, so it
+// doesn't need the link during the upload window.
+void bleRadioDownForUpload() {
+  bleUploadHandoff = true;
+  NimBLEDevice::stopAdvertising();
+  if (bleClientConnected) {
+    NimBLEServer* s = NimBLEDevice::getServer();
+    if (s) s->disconnect(bleConnHandle);
+  }
+  netLogf("BLE off-air: radio handed to WiFi for upload");
+}
+
+// Restore BLE after the upload so the app can reconnect (and read DeviceStatus).
+void bleRadioUpAfterUpload() {
+  bleUploadHandoff = false;
+  NimBLEDevice::startAdvertising();
+  netLogf("BLE back on-air (advertising) after upload");
+}
+
 void serviceNet() {
   if (netState == NET_IDLE) {
     // NOTE: provisioning no longer brings WiFi up (that would drop the BLE link on
@@ -1493,6 +1520,7 @@ void serviceNet() {
       // from stranding the upload.
       if (!fullyStoppedAtExtension && (millis() - uploadReqMs < UPLOAD_SETTLE_TIMEOUT_MS)) return;
       uploadRequested = false;
+      bleRadioDownForUpload();            // free the radio so WiFi can actually join
       startWifiConnect(true);
     }
     return;
@@ -1512,6 +1540,7 @@ void serviceNet() {
       if (!ok) ok = doUpload();                                      // one retry over the live WiFi (review Issue 3)
       WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
       netLogf("WiFi disconnected (upload %s)", ok ? "OK" : "FAILED");
+      bleRadioUpAfterUpload();                                       // radio back to BLE; app can reconnect
       lastFaultCode = ok ? 0 : 0x12;                                 // 0x12 = upload_failed (recoverable; buffer kept)
       deviceState = DEV_IDLE;
       deviceStatusNotify();
@@ -1526,8 +1555,12 @@ void serviceNet() {
     netLogf("WiFi connect TIMEOUT joining '%s' after %lums (WiFi.status=%d; 3=connected,6=disconnected,4=connect_failed,1=no_ssid)",
             wifiSsid, (unsigned long)(millis() - netWifiStartMs), (int)WiFi.status());
     WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-    if (netForUpload) { lastFaultCode = 0x13; deviceState = DEV_IDLE; deviceStatusNotify(); } // 0x13 = wifi_join_failed
-    else wifiStatusNotify(1, 3);                                    // 3 = timeout
+    if (netForUpload) {
+      bleRadioUpAfterUpload();                                      // radio back to BLE even on failed upload
+      lastFaultCode = 0x13; deviceState = DEV_IDLE; deviceStatusNotify(); // 0x13 = wifi_join_failed
+    } else {
+      wifiStatusNotify(1, 3);                                       // 3 = timeout
+    }
     netState = NET_IDLE;
   }
 }
@@ -1625,9 +1658,19 @@ class ControlCB : public NimBLECharacteristicCallbacks {
 // the radio frees up (NimBLE 2.x may also auto-restart; this is explicit + logged).
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    bleConnHandle = connInfo.getConnHandle();
+    bleClientConnected = true;
     netLogf("BLE connected: peer=%s", connInfo.getAddress().toString().c_str());
   }
   void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
+    bleClientConnected = false;
+    // During an upload we deliberately drop BLE to free the radio — do NOT
+    // re-advertise here, or BLE would contend with the in-progress WiFi join.
+    // bleRadioUpAfterUpload() restarts advertising once the upload is done.
+    if (bleUploadHandoff) {
+      netLogf("BLE disconnected for WiFi-upload handoff (reason=0x%02X)", reason);
+      return;
+    }
     netLogf("BLE disconnected: peer=%s reason=0x%02X -> re-advertising",
             connInfo.getAddress().toString().c_str(), reason);
     NimBLEDevice::startAdvertising();
