@@ -47,7 +47,8 @@
 #include <esp_timer.h>   // esp_timer_get_time() for monotonic per-sample timestamps
 
 // Step D — mobile-contract integration.
-// NimBLE-Arduino (install via Library Manager; tested against the 1.4.x API).
+// NimBLE-Arduino 2.x (install via Library Manager). 2.x callback signatures
+// (onWrite(NimBLECharacteristic*, NimBLEConnInfo&)) and advertising API are used.
 // WiFi.h/WiFiClient are part of the ESP32 Arduino core. BLE and WiFi share the
 // radio, so the contract keeps them time-separated (BLE pre/post-set, WiFi only
 // for the post-set upload) — they are never active simultaneously.
@@ -1599,8 +1600,26 @@ void bleSetup() {
 
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(KNEVO_SVC_UUID);     // the app scans/filters by this service UUID
-  NimBLEDevice::startAdvertising();
+
+  // Primary advertisement: flags + the 128-bit service UUID. The app does a
+  // service-FILTERED scan (scanForPeripherals(withServices:[svc])), so iOS only
+  // reports peripherals carrying this UUID in the advertisement. flags(3) +
+  // 128-bit UUID(18) = 21 B, which leaves no room for the name in the same
+  // 31-byte legacy packet -> the name goes in the scan response below.
+  NimBLEAdvertisementData advData;
+  advData.setFlags(0x06);                   // LE General Discoverable + BR/EDR not supported
+  advData.addServiceUUID(KNEVO_SVC_UUID);
+  adv->setAdvertisementData(advData);
+
+  // Scan response: the local name. iOS reads this into CBAdvertisementDataLocalNameKey,
+  // which the app checks for the "knevo_" prefix. NimBLE 2.x does NOT auto-add the
+  // name from init() to the advertisement, so it must be set explicitly here.
+  NimBLEAdvertisementData scanData;
+  scanData.setName(KNEVO_BLE_NAME);
+  adv->setScanResponseData(scanData);
+  adv->enableScanResponse(true);
+
+  adv->start();
 }
 
 /* ============================================================
