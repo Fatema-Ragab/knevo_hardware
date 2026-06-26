@@ -1403,6 +1403,19 @@ void netLogf(const char* fmt, ...) {
   xSemaphoreGive(serialMutex);
 }
 
+// TEMP DEBUG (remove before deployment): dump a C-string as hex bytes so a mangled
+// WiFi credential (smart-quote, trailing space, look-alike Unicode, off-by-one,
+// hidden char) is visible byte-for-byte and can be compared to what was typed.
+// ASCII '+' = 0x2B, '=' = 0x3D, space = 0x20; a curly quote shows as 0xE2 0x80 ...
+void netLogHex(const char* label, const char* s) {
+  char line[240];
+  int n = snprintf(line, sizeof(line), "%s [%u B]:", label, (unsigned)strlen(s));
+  for (size_t i = 0; s[i] != 0 && n < (int)sizeof(line) - 4; i++) {
+    n += snprintf(line + n, sizeof(line) - n, " %02X", (uint8_t)s[i]);
+  }
+  netLogf("%s", line);
+}
+
 void deviceStatusNotify() {
   if (!chDevStatus) return;
   uint8_t b[3] = { (uint8_t)deviceState, BATTERY_PCT_UNKNOWN, lastFaultCode };  // §3.5: state, battery, fault
@@ -1613,6 +1626,8 @@ class WiFiConfigCB : public NimBLECharacteristicCallbacks {
     uint8_t n2 = passLen < 63 ? passLen : 63; memcpy(wifiPass, d + o, n2); wifiPass[n2] = 0;
     netLogf("WiFiConfig: SSID='%s' (%u-char pass), app=%u.%u.%u.%u:%u",
             wifiSsid, (unsigned)n2, appIp[0], appIp[1], appIp[2], appIp[3], appPort);
+    netLogHex("DEBUG SSID hex", wifiSsid);   // TEMP: compare these bytes to the real network name
+    netLogHex("DEBUG PASS hex", wifiPass);   // TEMP: compare these bytes to the real WiFi password
     // Single shared 2.4GHz radio: bringing WiFi up here (a "live cred test") tears
     // down THIS BLE link via coexistence before we can answer, so the WiFiStatus
     // notify the app is waiting for would never arrive -> provisioning hangs/fails.
